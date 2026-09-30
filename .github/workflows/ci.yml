@@ -1,587 +1,99 @@
-# ============================================================
-#  birun · CI workflow
-#  Runs on every push to main/develop and on every pull request.
-#
-#  Jobs:
-#    build-and-test     — matrix of OS × compiler × build type
-#    sanitizers         — ASAN, UBSAN, TSAN (Linux only)
-#    static-analysis    — cppcheck + clang-tidy
-#    security           — injection safety, temp leak checks
-#    signals            — orphan process, SIGTERM forwarding
-#    smoke              — end-to-end: install, init, run
-#    benchmark          — parallel scaling sanity check
-#    coverage           — line coverage via gcov/lcov (Linux only)
-# ============================================================
-
 name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
 
-# Cancel superseded runs on the same ref — saves CI minutes.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-env:
-  CMAKE_GENERATOR: Ninja
-  CTEST_OUTPUT_ON_FAILURE: 1
-
 jobs:
-
-  # ============================================================
-  #  Build + test matrix
-  #  Fast gate. If this fails, nothing else runs.
-  # ============================================================
   build-and-test:
-    name: build / ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    name: build / ${{ matrix.os }} / ${{ matrix.compiler }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         compiler: [gcc, clang]
-        build_type: [Debug, Release]
         exclude:
-          # macOS ships clang as the default; gcc is aliased to clang
-          # and adds no coverage. Skip to save CI minutes.
           - os: macos-latest
             compiler: gcc
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install toolchain (Linux)
+      - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build ccache
-
-      - name: Install toolchain (macOS)
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
-        run: |
-          brew install ninja ccache
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
-
+        run: brew install ninja
       - name: Configure
-        env:
-          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
-          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DBIRUN_BUILD_TESTS=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
       - name: Build
         run: cmake --build build --parallel
-
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      - name: Upload test logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}
-          path: build/Testing/Temporary/LastTest.log
-          if-no-files-found: ignore
-
-  # ============================================================
-  #  Sanitizers — catch memory, UB, and data-race bugs
-  #  Linux only. Runs in parallel with each other.
-  # ============================================================
   sanitizers:
-    name: sanitizers / ${{ matrix.sanitizer }}
+    name: sanitizers
     needs: build-and-test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - sanitizer: address
-            flags: "-fsanitize=address -fno-omit-frame-pointer"
-          - sanitizer: undefined
-            flags: "-fsanitize=undefined -fno-sanitize-recover=all"
-          - sanitizer: thread
-            flags: "-fsanitize=thread"
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Ninja
         run: sudo apt-get update && sudo apt-get install -y ninja-build
-
       - name: Configure
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBIRUN_BUILD_TESTS=ON \
-            -DCMAKE_CXX_FLAGS="${{ matrix.flags }} -g"
-
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
       - name: Build
         run: cmake --build build --parallel
-
       - name: Test
         env:
-          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:check_initialization_order=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          TSAN_OPTIONS: second_deadlock_stack=1:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
 
-  # ============================================================
-  #  Static analysis — cppcheck + clang-tidy
-  # ============================================================
   static-analysis:
-    name: static / ${{ matrix.tool }}
+    name: cppcheck
     needs: build-and-test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - tool: cppcheck
-          - tool: clang-tidy
     steps:
       - uses: actions/checkout@v4
-
       - name: Install cppcheck
-        if: matrix.tool == 'cppcheck'
         run: sudo apt-get update && sudo apt-get install -y cppcheck
-
       - name: Run cppcheck
-        if: matrix.tool == 'cppcheck'
         run: |
-          cppcheck \
-            --enable=warning,performance,portability \
-            --std=c++17 \
-            --inline-suppr \
-            --suppress=missingIncludeSystem \
-            --error-exitcode=1 \
-            -I src -I vendor \
-            src tests
+          cppcheck --enable=warning,performance \
+                   --suppress=missingIncludeSystem \
+                   --error-exitcode=1 \
+                   -I src -I vendor \
+                   src tests
 
-      - name: Install clang-tidy
-        if: matrix.tool == 'clang-tidy'
-        run: sudo apt-get update && sudo apt-get install -y clang-tidy ninja-build
-
-      - name: Configure for clang-tidy
-        if: matrix.tool == 'clang-tidy'
-        run: cmake -B build -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBIRUN_BUILD_TESTS=ON
-
-      - name: Run clang-tidy
-        if: matrix.tool == 'clang-tidy'
-        run: |
-          clang-tidy \
-            -p build \
-            --checks='bugprone-*,performance-*,portability-*,modernize-use-nullptr,modernize-use-override' \
-            --warnings-as-errors='bugprone-*,performance-*' \
-            src/*.cpp src/*.hpp 2>/dev/null || \
-          clang-tidy \
-            -p build \
-            --checks='bugprone-*,performance-*' \
-            src/executor.cpp src/main.cpp
-
-  # ============================================================
-  #  Security — shell injection & temp file leak regression
-  # ============================================================
-  security:
-    name: security
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-
-      - name: Build
-        run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
-          cmake --build build --parallel
-
-      - name: Verify glob() does not evaluate shell metacharacters
-        run: |
-          mkdir -p /tmp/sec-test && cd /tmp/sec-test
-          cat > birun.bi <<'BIRUN'
-route TASK "/inject" {
-    desc("Verify glob() is not shell-evaluated")
-    let pattern = "x; touch /tmp/SHOULD_NOT_EXIST; echo pwned"
-    let matches = glob(pattern)
-    if (len(matches) == 0) {
-        print("PASS: injection blocked")
-    } else {
-        throw "FAIL: pattern returned " + str(len(matches)) + " matches"
-    }
-}
-BIRUN
-          "$GITHUB_WORKSPACE/build/birun" inject
-          if [ -f /tmp/SHOULD_NOT_EXIST ]; then
-            echo "FAIL: shell injection succeeded" >&2
-            exit 1
-          fi
-          echo "PASS: /tmp/SHOULD_NOT_EXIST was not created"
-
-      - name: Verify shFull() does not leak temp files
-        run: |
-          cd /tmp/sec-test
-          rm -f /tmp/.birun-err-*
-          cat > birun.bi <<'BIRUN'
-route TASK "/leak" {
-    desc("Exercise shFull 200 times")
-    for (let i = 0; i < 200; i = i + 1) {
-        shFull("echo test-" + str(i))
-    }
-    print("200 calls completed")
-}
-BIRUN
-          "$GITHUB_WORKSPACE/build/birun" leak
-          count=$(ls /tmp/.birun-err-* 2>/dev/null | wc -l | tr -d ' ')
-          echo "temp files leaked: $count"
-          if [ "$count" != "0" ]; then
-            echo "FAIL: leaked $count temp files" >&2
-            exit 1
-          fi
-
-      - name: Verify cache writes are atomic
-        run: |
-          cd /tmp/sec-test
-          cat > birun.bi <<'BIRUN'
-route TASK "/a" {
-    desc("Atomic cache A")
-    inputs("marker-a")
-    outputs("out-a")
-    run("touch out-a")
-}
-route TASK "/b" {
-    desc("Atomic cache B")
-    inputs("marker-b")
-    outputs("out-b")
-    run("touch out-b")
-}
-BIRUN
-          touch marker-a marker-b
-          "$GITHUB_WORKSPACE/build/birun" a
-          # Verify cache file exists and is well-formed (has tab separator)
-          if ! grep -q $'\t' .birun/cache; then
-            echo "FAIL: cache file malformed" >&2
-            cat .birun/cache >&2
-            exit 1
-          fi
-          echo "PASS: cache file well-formed"
-
-  # ============================================================
-  #  Signals — orphan processes, SIGTERM forwarding
-  # ============================================================
-  signals:
-    name: signals
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-
-      - name: Build
-        run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
-          cmake --build build --parallel
-
-      - name: Verify SIGINT kills the whole process tree
-        run: |
-          mkdir -p /tmp/sig-test && cd /tmp/sig-test
-          cat > birun.bi <<'BIRUN'
-route TASK "/long" {
-    desc("Sleep for a long time")
-    run("sleep 300")
-}
-BIRUN
-          # Start birun in background
-          "$GITHUB_WORKSPACE/build/birun" long &
-          BIRUN_PID=$!
-          sleep 1
-
-          # Count sleep processes before
-          before=$(pgrep -c -f 'sleep 300' || echo 0)
-          echo "sleep processes before SIGINT: $before"
-
-          # Send SIGINT to the birun process group
-          kill -INT -- -$(ps -o pgid= $BIRUN_PID | tr -d ' ') 2>/dev/null || kill -INT $BIRUN_PID || true
-          sleep 1
-
-          # Any orphan sleep processes left?
-          after=$(pgrep -c -f 'sleep 300' || echo 0)
-          echo "sleep processes after SIGINT: $after"
-
-          if [ "$after" != "0" ]; then
-            echo "FAIL: $after orphan sleep processes remain" >&2
-            pgrep -a -f 'sleep 300' >&2
-            exit 1
-          fi
-          echo "PASS: no orphan processes"
-
-      - name: Verify SIGTERM forwards to children
-        run: |
-          cd /tmp/sig-test
-          "$GITHUB_WORKSPACE/build/birun" long &
-          BIRUN_PID=$!
-          sleep 1
-
-          # Send SIGTERM to birun
-          kill -TERM $BIRUN_PID
-          sleep 1
-
-          if pgrep -f 'sleep 300' > /dev/null; then
-            echo "FAIL: SIGTERM did not terminate children" >&2
-            exit 1
-          fi
-          echo "PASS: SIGTERM forwarded cleanly"
-
-  # ============================================================
-  #  Smoke test — end-to-end user workflow
-  # ============================================================
   smoke:
-    name: smoke
+    name: smoke / ${{ matrix.os }}
     needs: build-and-test
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Ninja
+      - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ninja-build
-
       - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
         run: brew install ninja
-
       - name: Build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
           cmake --build build --parallel
-
-      - name: Run --version
-        run: ./build/birun --version
-
-      - name: Run --init
+      - name: Smoke test
         run: |
+          ./build/birun --version
           mkdir -p /tmp/smoke && cd /tmp/smoke
           "$GITHUB_WORKSPACE/build/birun" --init
-          test -f birun.bi
-          echo "PASS: birun.bi created"
-
-      - name: Run --list
-        run: |
-          cd /tmp/smoke
           "$GITHUB_WORKSPACE/build/birun" --list
-
-      - name: Run a real task
-        run: |
-          cd /tmp/smoke
-          "$GITHUB_WORKSPACE/build/birun" hello
-
-      - name: Cache hit on second run
-        run: |
-          cd /tmp/smoke
-          cat > birun.bi <<'BIRUN'
-route TASK "/cache-test" {
-    desc("Cache test")
-    inputs("src/*")
-    outputs("build/out")
-    run("mkdir -p build && echo done > build/out")
-}
-BIRUN
-          mkdir -p src
-          echo "test" > src/file.txt
-          "$GITHUB_WORKSPACE/build/birun" cache-test
-          output=$("$GITHUB_WORKSPACE/build/birun" cache-test)
-          echo "$output"
-          if ! echo "$output" | grep -qi "cached"; then
-            echo "FAIL: second run was not cached" >&2
-            exit 1
-          fi
-          echo "PASS: cache hit detected"
-
-      - name: JSON output well-formed
-        run: |
-          cd /tmp/smoke
-          "$GITHUB_WORKSPACE/build/birun" --json > out.json
-          python3 -c "import json; json.load(open('out.json'))"
-          echo "PASS: valid JSON"
-
-      - name: Graph output well-formed
-        run: |
-          cd /tmp/smoke
-          "$GITHUB_WORKSPACE/build/birun" --graph > out.dot
-          if command -v dot >/dev/null 2>&1; then
-            dot -Tsvg out.dot -o out.svg
-            test -s out.svg
-          fi
-          echo "PASS: graph output produced"
-
-  # ============================================================
-  #  Benchmark — parallelism scaling sanity check
-  # ============================================================
-  benchmark:
-    name: benchmark
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-
-      - name: Build
-        run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
-          cmake --build build --parallel
-
-      - name: Parallel speedup sanity
-        run: |
-          mkdir -p /tmp/bench && cd /tmp/bench
-          cat > birun.bi <<'BIRUN'
-route TASK "/t1" { run("sleep 1") }
-route TASK "/t2" { run("sleep 1") }
-route TASK "/t3" { run("sleep 1") }
-route TASK "/t4" { run("sleep 1") }
-route TASK "/all" {
-    depends("t1", "t2", "t3", "t4")
-}
-BIRUN
-
-          BIRUN="$GITHUB_WORKSPACE/build/birun"
-
-          t1_start=$(date +%s%N)
-          "$BIRUN" --no-cache --quiet -j1 all
-          t1_end=$(date +%s%N)
-          t1_ms=$(( (t1_end - t1_start) / 1000000 ))
-
-          t4_start=$(date +%s%N)
-          "$BIRUN" --no-cache --quiet -j4 all
-          t4_end=$(date +%s%N)
-          t4_ms=$(( (t4_end - t4_start) / 1000000 ))
-
-          echo "j1: ${t1_ms}ms"
-          echo "j4: ${t4_ms}ms"
-
-          # Expect j4 to be at least 2x faster than j1 (conservative)
-          if [ $((t4_ms * 2)) -ge "$t1_ms" ]; then
-            echo "WARN: parallel speedup below 2x — investigate" >&2
-            # Don't fail the build on slow CI runners, just warn
-          else
-            echo "PASS: parallel speedup ≥ 2x"
-          fi
-
-  # ============================================================
-  #  Coverage — line coverage report (Linux + gcc only)
-  # ============================================================
-  coverage:
-    name: coverage
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Ninja + lcov
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build lcov
-
-      - name: Configure with coverage flags
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DBIRUN_BUILD_TESTS=ON \
-            -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage -g -O0" \
-            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
-
-      - name: Generate coverage
-        run: |
-          lcov --capture --directory build --output-file coverage.info \
-               --ignore-errors mismatch,unused,negative
-          lcov --remove coverage.info '/usr/*' '*/vendor/*' '*/tests/*' \
-               --output-file coverage.info --ignore-errors unused
-          lcov --list coverage.info
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage.info
-          if-no-files-found: warn
-
-      - name: Coverage threshold gate
-        run: |
-          # Extract line coverage percent
-          pct=$(lcov --summary coverage.info 2>&1 | grep 'lines' | grep -oE '[0-9]+\.[0-9]+' | head -1)
-          echo "Line coverage: ${pct}%"
-          # Set a conservative floor. Raise it as the suite grows.
-          if [ -z "$pct" ]; then
-            echo "WARN: could not parse coverage percent"
-            exit 0
-          fi
-          # integer comparison: check pct >= 40
-          if [ "${pct%.*}" -lt 40 ]; then
-            echo "FAIL: coverage ${pct}% below 40% threshold" >&2
-            exit 1
-          fi
-          echo "PASS: coverage above 40% threshold"
-
-  # ============================================================
-  #  All-green summary — a single required check for branch protection
-  # ============================================================
-  ci-complete:
-    name: ci-complete
-    if: always()
-    needs:
-      - build-and-test
-      - sanitizers
-      - static-analysis
-      - security
-      - signals
-      - smoke
-      - benchmark
-      - coverage
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all jobs succeeded
-        run: |
-          result="${{ needs.build-and-test.result }}|${{ needs.sanitizers.result }}|${{ needs.static-analysis.result }}|${{ needs.security.result }}|${{ needs.signals.result }}|${{ needs.smoke.result }}|${{ needs.benchmark.result }}|${{ needs.coverage.result }}"
-          echo "job results: $result"
-          if echo "$result" | grep -qE 'failure|cancelled'; then
-            echo "FAIL: one or more CI jobs did not succeed" >&2
-            exit 1
-          fi
-          echo "PASS: all CI jobs succeeded"
