@@ -7,7 +7,9 @@
 #include "bi/builtins.hpp"
 #include "bi/interpreter.hpp"
 #include "bi/value.hpp"
+#include "cache.hpp"
 #include "executor.hpp"
+#include "proc.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,18 +19,13 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
 namespace birun {
 
-// Task currently being populated during `route TASK "/x" { ... }`.
 inline Task* g_currentTask = nullptr;
 
-// ------------------------------------------------------------
-//  Internal helpers
-// ------------------------------------------------------------
 namespace detail {
 
 inline std::string trim(const std::string& s) {
@@ -36,19 +33,6 @@ inline std::string trim(const std::string& s) {
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
-}
-
-inline std::string capture(const std::string& cmd, int& code) {
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) { code = -1; return ""; }
-    std::string out;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, p)) > 0)
-        out.append(buf, n);
-    int rc = pclose(p);
-    code = (rc != -1 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
-    return out;
 }
 
 inline bool isExecutable(const std::string& p) {
@@ -88,9 +72,6 @@ inline std::string which(const std::string& name) {
 
 } // namespace detail
 
-// ------------------------------------------------------------
-//  Registration
-// ------------------------------------------------------------
 inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
     using bi::Value;
     using bi::ValueList;
@@ -105,7 +86,7 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
     using bi::def;
 
     // ============================================================
-    //  Task definition
+    //  Task definition builtins
     // ============================================================
     def(g, "desc", [](ValueList& a) -> Value {
         if (!g_currentTask)
@@ -147,12 +128,6 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
         return vnil();
     });
 
-
-    
-
-    // ============================================================
-    //  inputs(...)  — source globs for caching
-    // ============================================================
     def(g, "inputs", [](ValueList& a) -> Value {
         if (!g_currentTask)
             throw std::runtime_error(
@@ -173,9 +148,6 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
         return vnil();
     });
 
-    // ============================================================
-    //  outputs(...)  — expected output paths
-    // ============================================================
     def(g, "outputs", [](ValueList& a) -> Value {
         if (!g_currentTask)
             throw std::runtime_error(
@@ -198,6 +170,8 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
 
     // ============================================================
     //  sh(cmd) / sh(cmd, false)
+    //    Runs through fork/exec; child gets its own process group.
+    //    SIGINT/SIGTERM in parent → child is killed.
     // ============================================================
     def(g, "sh", [](ValueList& a) -> Value {
         if (a.empty() || a[0].type != Value::STR)
@@ -206,12 +180,13 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
         bool strict = true;
         if (a.size() > 1) strict = truthy(a[1]);
 
-        int code = 0;
-        std::string out = detail::capture("(" + cmd + ") 2>&1", code);
+        std::string out;
+        int code = proc::runCaptured(cmd, &out);
         if (strict && code != 0) {
             std::string msg = "sh: command failed (exit " +
                               std::to_string(code) + "): " + cmd;
-            if (!out.empty()) msg += "\n  " + detail::trim(out);
+            std::string t = detail::trim(out);
+            if (!t.empty()) msg += "\n  " + t;
             throw std::runtime_error(msg);
         }
         return vstr(detail::trim(out));
@@ -223,39 +198,20 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
     def(g, "shStatus", [](ValueList& a) -> Value {
         if (a.empty() || a[0].type != Value::STR)
             throw std::runtime_error("shStatus(cmd): cmd must be a string");
-        int code = 0;
-        detail::capture("(" + std::string(a[0].strView()) +
-                        ") >/dev/null 2>&1", code);
+        int code = proc::runSilent(std::string(a[0].strView()));
         return vint(code);
     });
 
     // ============================================================
     //  shFull(cmd) -> { code, out, err }
+    //    Uses poll() on two pipes — no temp file, no leak.
     // ============================================================
     def(g, "shFull", [](ValueList& a) -> Value {
         if (a.empty() || a[0].type != Value::STR)
             throw std::runtime_error("shFull(cmd): cmd must be a string");
 
-        char tmpl[] = "/tmp/.birun-err-XXXXXX";
-        int fd = mkstemp(tmpl);
-        if (fd < 0)
-            throw std::runtime_error("shFull: cannot create temp file");
-        close(fd);
-        std::string errPath = tmpl;
-
-        int code = 0;
-        std::string out = detail::capture(
-            "(" + std::string(a[0].strView()) + ") 2>" + errPath, code);
-
-        std::string err;
-        {
-            std::ifstream f(errPath);
-            if (f) {
-                std::stringstream ss; ss << f.rdbuf();
-                err = ss.str();
-            }
-        }
-        std::remove(errPath.c_str());
+        std::string out, err;
+        int code = proc::runSplit(std::string(a[0].strView()), &out, &err);
 
         auto m = std::make_shared<ValueMap>();
         (*m)["code"] = vint(code);
@@ -285,23 +241,17 @@ inline void registerBirunBuiltins(std::shared_ptr<bi::Env> g) {
 
     // ============================================================
     //  glob(pattern) -> array of paths
+    //    Pure C++ — no shell, no injection surface.
     // ============================================================
     def(g, "glob", [](ValueList& a) -> Value {
         if (a.empty() || a[0].type != Value::STR)
             throw std::runtime_error("glob(pattern): pattern must be a string");
         std::string pat(a[0].strView());
-        int code = 0;
-        std::string out = detail::capture(
-            "(printf '%s\\n' " + pat + ") 2>/dev/null", code);
 
+        auto expanded = cache::expandGlob(pat);
         auto arr = std::make_shared<ValueList>();
-        std::istringstream is(out);
-        std::string line;
-        while (std::getline(is, line)) {
-            if (line.empty()) continue;
-            if (line == pat) continue;
-            arr->push_back(vstr(line));
-        }
+        arr->reserve(expanded.size());
+        for (auto& p : expanded) arr->push_back(vstr(p));
         return varr(arr);
     });
 

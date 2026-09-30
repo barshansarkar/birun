@@ -5,6 +5,7 @@
 #include "cache.hpp"
 #include "executor.hpp"
 #include "extras.hpp"
+#include "proc.hpp"          // <-- NEW: signal handling + process groups
 #include "theme.hpp"
 #include "watch.hpp"
 
@@ -25,7 +26,11 @@ using namespace bi;
 using namespace birun;
 using namespace birun::theme;
 
-static const char* VERSION = "0.6.0";
+#ifndef BIRUN_VERSION
+#define BIRUN_VERSION "0.0.0-dev"
+#endif
+
+static const char* VERSION = BIRUN_VERSION;
 
 static std::map<std::string, Task> g_tasks;
 static std::vector<std::string>    g_taskOrder;
@@ -215,15 +220,12 @@ static int runOnce() {
 
 // ============================================================
 //  Watch mode
+//    Signal handling is done by proc::installSignalHandlers()
+//    (called once in main). Here we only check the shutdown flag.
 // ============================================================
 static int runWatchMode() {
     const std::string& cfgFile = g_opt.file;
     std::vector<std::string> roots = { cfgFile, "." };
-
-    std::signal(SIGINT, [](int) {
-        std::cout << "\n  " << warn("stopped") << "\n";
-        std::_Exit(0);
-    });
 
     std::cout << "  " << bold(accent("birun")) << " "
               << rule(sym::dot()) << " "
@@ -241,13 +243,18 @@ static int runWatchMode() {
     }
 
     for (;;) {
+        if (proc::shutdownRequested()) break;
+
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        if (proc::shutdownRequested()) break;
 
         auto nowSnap = birun::watch::snapshot(roots);
         auto changed = birun::watch::diff(lastSnap, nowSnap);
         if (changed.empty()) continue;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        if (proc::shutdownRequested()) break;
+
         auto settled = birun::watch::snapshot(roots);
         changed = birun::watch::diff(lastSnap, settled);
         lastSnap = std::move(settled);
@@ -282,16 +289,18 @@ static int runWatchMode() {
                       << danger(e.what()) << "\n";
         }
     }
+
     return 0;
 }
 
 // ============================================================
 //  main
 // ============================================================
-// ============================================================
-//  main
-// ============================================================
 int main(int argc, char** argv) {
+    // Install signal handlers FIRST — so any child spawned later is
+    // tracked and killed cleanly on SIGINT / SIGTERM / SIGHUP.
+    proc::installSignalHandlers();
+
     try {
         for (int i = 1; i < argc; i++) {
             std::string a = argv[i];

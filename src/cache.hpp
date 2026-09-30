@@ -4,7 +4,7 @@
 //  Task caching based on input file hashes + task definition.
 // ============================================================
 
-#include "executor.hpp"   // for Task
+#include "executor.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -13,7 +13,9 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace birun::cache {
@@ -49,7 +51,7 @@ inline uint64_t hashFile(const std::string& path) {
 }
 
 // ------------------------------------------------------------
-//  Wildcard match (single-segment, '*' and '?' only)
+//  Wildcard match ('*' and '?' only, single segment)
 // ------------------------------------------------------------
 inline bool wildcardMatch(const std::string& name, const std::string& pat) {
     size_t ni = 0, pi = 0;
@@ -127,7 +129,7 @@ inline std::vector<std::string> expandGlob(const std::string& pattern) {
 }
 
 // ------------------------------------------------------------
-//  Hash a set of glob patterns (kept for backward compat)
+//  Hash a set of glob patterns
 // ------------------------------------------------------------
 inline std::string hashInputs(const std::vector<std::string>& globs) {
     std::vector<std::string> files;
@@ -145,26 +147,19 @@ inline std::string hashInputs(const std::vector<std::string>& globs) {
     }
 
     char buf[32];
-    std::snprintf(buf, sizeof buf, "%016llx",
-                  (unsigned long long)combined);
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)combined);
     return std::string(buf);
 }
 
 // ------------------------------------------------------------
-//  NEW — hash the whole task definition + its input files.
-//  This invalidates the cache when the user edits:
-//    - a run() command
-//    - the description
-//    - a dependency name
-//    - an output path
-//    - any matched input file's contents
+//  Hash task definition + input files
 // ------------------------------------------------------------
 inline std::string hashTask(const Task& t) {
     uint64_t combined = 1469598103934665603ULL;
 
     auto mixStr = [&combined](const std::string& s) {
         combined = fnv1a(s.data(), s.size(), combined);
-        const char sep = '\x1f';           // unit separator
+        const char sep = '\x1f';
         combined = fnv1a(&sep, 1, combined);
     };
 
@@ -173,7 +168,6 @@ inline std::string hashTask(const Task& t) {
     for (const auto& d : t.depends) mixStr(d);
     for (const auto& o : t.outputs) mixStr(o);
 
-    // Input file contents
     std::vector<std::string> files;
     for (const auto& g : t.inputs) {
         auto expanded = expandGlob(g);
@@ -188,8 +182,7 @@ inline std::string hashTask(const Task& t) {
     }
 
     char buf[32];
-    std::snprintf(buf, sizeof buf, "%016llx",
-                  (unsigned long long)combined);
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)combined);
     return std::string(buf);
 }
 
@@ -209,19 +202,20 @@ inline bool outputsExist(const std::vector<std::string>& outputs) {
 }
 
 // ------------------------------------------------------------
-//  Cache storage
+//  Cache storage — ATOMIC write via temp + rename
 // ------------------------------------------------------------
 struct CacheStore {
     std::map<std::string, std::string> entries;
 
     static CacheStore load(const std::string& path) {
         CacheStore c;
-        std::ifstream f(path);
+        std::ifstream f(path, std::ios::binary);
         if (!f) return c;
         std::string line;
         while (std::getline(f, line)) {
+            if (line.empty()) continue;
             auto tab = line.find('\t');
-            if (tab == std::string::npos) continue;
+            if (tab == std::string::npos) continue;   // skip malformed
             c.entries[line.substr(0, tab)] = line.substr(tab + 1);
         }
         return c;
@@ -233,9 +227,37 @@ struct CacheStore {
             std::error_code ec;
             fs::create_directories(dir, ec);
         }
-        std::ofstream f(path);
-        for (const auto& kv : entries)
-            f << kv.first << '\t' << kv.second << '\n';
+
+        // Write to temp file in the SAME directory (so rename is atomic on POSIX)
+        std::string tmp = path + ".tmp." + std::to_string(::getpid());
+
+        bool ok = true;
+        {
+            std::ofstream f(tmp, std::ios::trunc | std::ios::binary);
+            if (!f) {
+                ok = false;
+            } else {
+                for (const auto& kv : entries)
+                    f << kv.first << '\t' << kv.second << '\n';
+                f.flush();
+                if (!f) ok = false;
+            }
+        }
+
+        if (!ok) {
+            std::error_code ec;
+            fs::remove(tmp, ec);
+            throw std::runtime_error("cache: cannot write '" + path + "'");
+        }
+
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            std::error_code ec2;
+            fs::remove(tmp, ec2);
+            throw std::runtime_error(
+                "cache: cannot replace '" + path + "': " + ec.message());
+        }
     }
 };
 
@@ -248,9 +270,8 @@ inline std::string cacheFilePath() {
     return ".birun/cache";
 }
 
-
 // ------------------------------------------------------------
-//  Clean — delete the cache file (idempotent)
+//  Clean — delete cache file
 // ------------------------------------------------------------
 inline bool cleanCache() {
     std::string path = cacheFilePath();

@@ -1,5 +1,6 @@
 #include "executor.hpp"
 #include "cache.hpp"
+#include "proc.hpp"
 #include "theme.hpp"
 
 #include <atomic>
@@ -10,7 +11,6 @@
 #include <queue>
 #include <stdexcept>
 #include <string>
-#include <sys/wait.h>
 #include <thread>
 
 namespace birun {
@@ -56,7 +56,7 @@ std::vector<std::string> Executor::plan(const std::string& target) {
 }
 
 // ============================================================
-//  Print helpers (verbosity-aware)
+//  Print helpers
 // ============================================================
 void Executor::printHeader(const Task& t, int idx, int total) const {
     if (opt_.verbosity == Verbosity::Quiet) return;
@@ -93,7 +93,6 @@ void Executor::printCached(const Task& t) const {
 }
 
 void Executor::printFail(const Task& t, int code) const {
-    // Errors are always shown, even in quiet mode.
     std::cout << "  " << danger(sym::fail()) << " "
               << name(padName(t.name, 22))
               << "  " << danger("exit " + std::to_string(code))
@@ -105,12 +104,15 @@ void Executor::printFail(const Task& t, int code) const {
 //  runCommands
 //    captured == nullptr  → stream live to stdout (sequential)
 //    captured != nullptr  → buffer stdout+stderr (parallel)
+//  Uses proc::* (fork/exec, process groups, signal-safe).
 // ============================================================
 int Executor::runCommands(const Task& t, std::string* captured) const {
     if (t.runs.empty()) return 0;
     const bool showCmd = (opt_.verbosity != Verbosity::Quiet);
 
     for (const auto& cmd : t.runs) {
+        if (proc::shutdownRequested()) return 130;
+
         if (captured) {
             if (showCmd) {
                 *captured += "    ";
@@ -125,24 +127,11 @@ int Executor::runCommands(const Task& t, std::string* captured) const {
             std::cout.flush();
         }
 
-        int rc;
-        if (captured) {
-            std::string full = "(" + cmd + ") 2>&1";
-            FILE* p = popen(full.c_str(), "r");
-            if (!p) {
-                *captured += "    [error: popen failed]\n";
-                return 1;
-            }
-            char buf[4096];
-            size_t n;
-            while ((n = std::fread(buf, 1, sizeof buf, p)) > 0)
-                captured->append(buf, n);
-            rc = pclose(p);
-        } else {
-            rc = std::system(cmd.c_str());
-        }
+        int code = captured
+            ? proc::runCaptured(cmd, captured)
+            : proc::runLive(cmd);
 
-        int code = (rc != -1 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : 1;
+        if (proc::shutdownRequested()) return 130;
         if (code != 0) return code;
     }
     return 0;
@@ -211,14 +200,20 @@ int Executor::runSequential() {
     auto wall0 = std::chrono::steady_clock::now();
 
     std::string cachePath = cache::cacheFilePath();
-    auto store = opt_.noCache ? cache::CacheStore{}
-                              : cache::CacheStore::load(cachePath);
+    cache::CacheStore store = opt_.noCache ? cache::CacheStore{}
+                                           : cache::CacheStore::load(cachePath);
     bool dirty = false;
 
     for (const auto& n : order_) {
+        if (proc::shutdownRequested()) {
+            if (dirty && !opt_.noCache) {
+                try { store.save(cachePath); } catch (...) {}
+            }
+            return 130;
+        }
+
         const Task& t = tasks_.at(n);
 
-        // ---- cache lookup (skip if --force) ----
         if (!opt_.noCache && !t.inputs.empty()) {
             std::string h = cache::hashTask(t);
             auto it = store.entries.find(n);
@@ -251,7 +246,9 @@ int Executor::runSequential() {
 
         if (rc != 0) {
             printFail(t, rc);
-            if (dirty && !opt_.noCache) store.save(cachePath);
+            if (dirty && !opt_.noCache) {
+                try { store.save(cachePath); } catch (...) {}
+            }
             return rc;
         }
         printDone(t, dt);
@@ -262,7 +259,14 @@ int Executor::runSequential() {
         }
     }
 
-    if (dirty && !opt_.noCache) store.save(cachePath);
+    if (dirty && !opt_.noCache) {
+        try { store.save(cachePath); }
+        catch (std::exception& e) {
+            if (opt_.verbosity != Verbosity::Quiet)
+                std::cerr << "  " << warn(sym::spark()) << " "
+                          << warn(std::string("cache: ") + e.what()) << "\n";
+        }
+    }
 
     if (opt_.verbosity == Verbosity::Verbose) {
         double w = std::chrono::duration<double>(
@@ -302,8 +306,8 @@ int Executor::runParallel() {
     if (nWorkers < 1) nWorkers = 1;
 
     std::string cachePath = cache::cacheFilePath();
-    auto store = opt_.noCache ? cache::CacheStore{}
-                              : cache::CacheStore::load(cachePath);
+    cache::CacheStore store = opt_.noCache ? cache::CacheStore{}
+                                           : cache::CacheStore::load(cachePath);
     std::mutex cacheMtx;
     bool dirty = false;
     auto wall0 = std::chrono::steady_clock::now();
@@ -312,6 +316,7 @@ int Executor::runParallel() {
         workers.emplace_back([&] {
             for (;;) {
                 if (failed.load() > 0) return;
+                if (proc::shutdownRequested()) return;
 
                 std::string taskName;
                 {
@@ -364,13 +369,11 @@ int Executor::runParallel() {
                     }
                 }
 
-                // ---------- starting indicator ----------
                 {
                     std::lock_guard<std::mutex> lk(g_outMtx);
                     printHeader(t);
                 }
 
-                // ---------- run WITHOUT holding g_outMtx ----------
                 auto t0 = std::chrono::steady_clock::now();
                 std::string captured;
                 int rc = runCommands(t, &captured);
@@ -380,7 +383,6 @@ int Executor::runParallel() {
                 runningCount.fetch_sub(1);
                 done.fetch_add(1);
 
-                // ---------- flush output atomically ----------
                 {
                     std::lock_guard<std::mutex> lk(g_outMtx);
                     if (!captured.empty()) {
@@ -413,8 +415,17 @@ int Executor::runParallel() {
 
     for (auto& w : workers) w.join();
 
+    if (proc::shutdownRequested()) {
+        if (dirty && !opt_.noCache) {
+            try { store.save(cachePath); } catch (...) {}
+        }
+        return 130;
+    }
+
     if (failed.load() != 0) {
-        if (dirty && !opt_.noCache) store.save(cachePath);
+        if (dirty && !opt_.noCache) {
+            try { store.save(cachePath); } catch (...) {}
+        }
         return failed.load();
     }
 
@@ -426,7 +437,14 @@ int Executor::runParallel() {
         return 1;
     }
 
-    if (dirty && !opt_.noCache) store.save(cachePath);
+    if (dirty && !opt_.noCache) {
+        try { store.save(cachePath); }
+        catch (std::exception& e) {
+            if (opt_.verbosity != Verbosity::Quiet)
+                std::cerr << "  " << warn(sym::spark()) << " "
+                          << warn(std::string("cache: ") + e.what()) << "\n";
+        }
+    }
 
     if (opt_.verbosity == Verbosity::Verbose) {
         double w = std::chrono::duration<double>(

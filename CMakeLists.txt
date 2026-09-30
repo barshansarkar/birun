@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(birun VERSION 0.6.0 LANGUAGES CXX)
+project(birun VERSION 0.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,7 +24,9 @@ target_compile_options(birun_core PRIVATE -Wall -Wextra -O2)
 add_executable(birun src/main.cpp)
 target_link_libraries(birun PRIVATE birun_core)
 target_compile_options(birun PRIVATE -Wall -Wextra -O2)
-
+target_compile_definitions(birun PRIVATE
+    BIRUN_VERSION="${PROJECT_VERSION}"
+)
 install(TARGETS birun RUNTIME DESTINATION bin)
 
 # ---- tests ----
