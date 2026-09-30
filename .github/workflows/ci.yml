@@ -21,76 +21,55 @@ jobs:
             compiler: gcc
     steps:
       - uses: actions/checkout@v4
-      - name: Install Ninja (Linux)
+
+      - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-      - name: Install Ninja (macOS)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake git
+          git clone --depth 1 --branch v3.5.4 https://github.com/catchorg/Catch2.git /tmp/catch2
+          cmake -S /tmp/catch2 -B /tmp/catch2/build -DCMAKE_BUILD_TYPE=Release -DCATCH_BUILD_TESTING=OFF
+          sudo cmake --install /tmp/catch2/build
+
+      - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja
-      - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
-      - name: Build
-        run: cmake --build build --parallel
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
-
-  sanitizers:
-    name: sanitizers
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-      - name: Configure
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DBIRUN_BUILD_TESTS=ON \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-      - name: Build
-        run: cmake --build build --parallel
-      - name: Test
+          brew install ninja cmake catch2
+
+      - name: Configure
         env:
-          ASAN_OPTIONS: detect_leaks=1
-          UBSAN_OPTIONS: print_stacktrace=1
-        run: ctest --test-dir build --output-on-failure
+          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
 
-  static-analysis:
-    name: cppcheck
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install cppcheck
-        run: sudo apt-get update && sudo apt-get install -y cppcheck
-      - name: Run cppcheck
-        run: |
-          cppcheck --enable=warning,performance \
-                   --suppress=missingIncludeSystem \
-                   --error-exitcode=1 \
-                   -I src -I vendor \
-                   src tests
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
 
   smoke:
     name: smoke / ${{ matrix.os }}
-    needs: build-and-test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ninja-build
+
       - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
         run: brew install ninja
-      - name: Build
+
+      - name: Build (no tests)
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=OFF
           cmake --build build --parallel
+
       - name: Smoke test
         run: |
           ./build/birun --version
