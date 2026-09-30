@@ -48,8 +48,29 @@ if ! curl -fsSL "$URL" -o "$TMP/$TARBALL"; then
 fi
 
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
+
+# Locate the binary. Support both layouts:
+#   flat:    birun
+#   nested:  birun-<version>-<os>-<arch>/birun
+BIN_PATH=""
+if [ -f "$TMP/$BIN" ]; then
+    BIN_PATH="$TMP/$BIN"
+else
+    BIN_PATH=$(find "$TMP" -type f -name "$BIN" -perm -u+x 2>/dev/null | head -n 1)
+    if [ -z "$BIN_PATH" ]; then
+        BIN_PATH=$(find "$TMP" -type f -name "$BIN" 2>/dev/null | head -n 1)
+    fi
+fi
+
+if [ -z "$BIN_PATH" ] || [ ! -f "$BIN_PATH" ]; then
+    echo "error: could not find '$BIN' in archive" >&2
+    echo "       contents were:" >&2
+    find "$TMP" -maxdepth 3 -type f >&2
+    exit 1
+fi
+
 mkdir -p "$INSTALL_DIR"
-install -m 0755 "$TMP/$BIN" "$INSTALL_DIR/$BIN"
+install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$BIN"
 
 echo "  installed to $INSTALL_DIR/$BIN"
 
