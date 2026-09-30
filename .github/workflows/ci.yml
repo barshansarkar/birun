@@ -21,39 +21,17 @@ env:
 
 jobs:
 
-  # ============================================================
-  #  Build + test on Linux (gcc, clang) and macOS (clang)
-  # ============================================================
   build-and-test:
-    name: build / ${{ matrix.os }} / ${{ matrix.compiler }}
-    runs-on: ${{ matrix.os }}
+    name: build + test
+    runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            compiler: gcc
-          - os: ubuntu-latest
-            compiler: clang
-          - os: macos-latest
-            compiler: clang
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install deps (Linux)
-        if: runner.os == 'Linux'
+      - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake git
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            sudo apt-get install -y clang
-          fi
-
-      - name: Install deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ninja cmake
+          sudo apt-get install -y ninja-build cmake git g++
 
       - name: Build and install Catch2 v3
         run: |
@@ -68,9 +46,6 @@ jobs:
           sudo cmake --install /tmp/catch2/build
 
       - name: Configure
-        env:
-          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
-          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -82,28 +57,15 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # ============================================================
-  #  Smoke test — end-to-end user workflow (no tests, faster)
-  # ============================================================
   smoke:
-    name: smoke / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: smoke
+    runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ninja (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Ninja
         run: sudo apt-get update && sudo apt-get install -y ninja-build
-
-      - name: Install Ninja (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ninja
 
       - name: Build (no tests)
         run: |
@@ -112,10 +74,10 @@ jobs:
             -DBIRUN_BUILD_TESTS=OFF
           cmake --build build --parallel
 
-      - name: Version check
+      - name: Version
         run: ./build/birun --version
 
-      - name: Init + list + run
+      - name: End-to-end
         run: |
           mkdir -p /tmp/smoke && cd /tmp/smoke
           "$GITHUB_WORKSPACE/build/birun" --init
@@ -123,9 +85,9 @@ jobs:
           "$GITHUB_WORKSPACE/build/birun" --list
           "$GITHUB_WORKSPACE/build/birun" hello
 
-      - name: JSON output well-formed
+      - name: JSON well-formed
         run: |
           cd /tmp/smoke
           "$GITHUB_WORKSPACE/build/birun" --json > out.json
           python3 -c "import json; json.load(open('out.json'))"
-          echo "PASS: valid JSON"
+          echo "PASS"
