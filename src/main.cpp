@@ -1,333 +1,108 @@
 #include "bi/interpreter.hpp"
 #include "bi/value.hpp"
 
-#include <atomic>
+#include "builtins_birun.hpp"
+#include "cache.hpp"
+#include "executor.hpp"
+#include "extras.hpp"
+#include "theme.hpp"
+#include "watch.hpp"
+
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <mutex>
-#include <queue>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 using namespace bi;
+using namespace birun;
+using namespace birun::theme;
 
-static const char* VERSION = "0.2.0";
-
-// ============================================================
-//  ANSI colors (thread-safe: just bool reads)
-// ============================================================
-namespace color {
-    inline bool enabled = false;
-    inline const char* RST() { return enabled ? "\033[0m"  : ""; }
-    inline const char* BLD() { return enabled ? "\033[1m"  : ""; }
-    inline const char* DIM() { return enabled ? "\033[2m"  : ""; }
-    inline const char* RED() { return enabled ? "\033[31m" : ""; }
-    inline const char* GRN() { return enabled ? "\033[32m" : ""; }
-    inline const char* CYN() { return enabled ? "\033[36m" : ""; }
-    inline const char* YEL() { return enabled ? "\033[33m" : ""; }
-}
-
-// ============================================================
-//  Task model
-// ============================================================
-struct Task {
-    std::string              name;
-    std::string              desc;
-    std::vector<std::string> depends;
-    std::vector<std::string> runs;
-};
+static const char* VERSION = "0.6.0";
 
 static std::map<std::string, Task> g_tasks;
 static std::vector<std::string>    g_taskOrder;
+static Options                     g_opt;
 
-// Global CLI options
-struct Options {
-    bool        dryRun = false;
-    int         jobs   = 1;        // 1 = sequential
-    bool        list   = false;
-    std::string file   = "birun.bi";
-    std::string task;
-    int         portOverride = 0;   // unused, kept for compat
-};
-static Options g_opt;
-
-// Task being built during `route TASK "/x" { ... }`
-static Task* g_current = nullptr;
+static bool        g_jsonMode       = false;
+static bool        g_graphMode      = false;
+static bool        g_initMode       = false;
+static bool        g_initForce      = false;
+static std::string g_completionShell;
 
 // ============================================================
-//  birun builtins
-// ============================================================
-static void registerBirunBuiltins(std::shared_ptr<Env> g) {
-
-    bi::def(g, "desc", [](ValueList& a) -> Value {
-        if (!g_current)
-            throw std::runtime_error("desc() only inside `route TASK \"/...\" { ... }`");
-        if (a.empty() || a[0].type != Value::STR)
-            throw std::runtime_error("desc(text): text must be a string");
-        g_current->desc = std::string(a[0].strView());
-        return vnil();
-    });
-
-    bi::def(g, "depends", [](ValueList& a) -> Value {
-        if (!g_current)
-            throw std::runtime_error("depends() only inside `route TASK \"/...\" { ... }`");
-        for (auto& v : a) {
-            if (v.type == Value::STR)
-                g_current->depends.push_back(std::string(v.strView()));
-            else if (v.type == Value::ARR)
-                for (auto& x : *v.arrPtr()) {
-                    if (x.type != Value::STR)
-                        throw std::runtime_error("depends: array must contain strings");
-                    g_current->depends.push_back(std::string(x.strView()));
-                }
-            else
-                throw std::runtime_error("depends: expected string or array");
-        }
-        return vnil();
-    });
-
-    bi::def(g, "run", [](ValueList& a) -> Value {
-        if (!g_current)
-            throw std::runtime_error("run() only inside `route TASK \"/...\" { ... }`");
-        if (a.empty() || a[0].type != Value::STR)
-            throw std::runtime_error("run(command): command must be a string");
-        g_current->runs.push_back(std::string(a[0].strView()));
-        return vnil();
-    });
-}
-
-// ============================================================
-//  Executor (with --dry-run and --jobs N)
-// ============================================================
-class Executor {
-public:
-    // Run `target` after its dependencies, respecting g_opt.
-    // Returns 0 on success, non-zero on first failure.
-    int run(const std::string& target) {
-        if (!g_tasks.count(target))
-            throw std::runtime_error("unknown task '" + target + "'");
-
-        // 1. Compute ordered list (topological)
-        order_.clear();
-        visited_.clear();
-        visiting_.clear();
-        visit(target);
-
-        // 2. Dry-run: just print plan
-        if (g_opt.dryRun) {
-            std::cout << color::YEL() << "[dry-run]" << color::RST()
-                      << " would execute " << order_.size() << " task(s):\n";
-            for (const auto& n : order_) {
-                const Task& t = g_tasks.at(n);
-                std::cout << "  " << color::CYN() << n << color::RST();
-                if (!t.desc.empty())
-                    std::cout << "  " << color::DIM() << t.desc << color::RST();
-                std::cout << "\n";
-                for (const auto& cmd : t.runs)
-                    std::cout << "      " << color::DIM() << "$ " << color::RST()
-                              << cmd << "\n";
-            }
-            return 0;
-        }
-
-        // 3. Jobs = 1 → sequential (original behaviour)
-        if (g_opt.jobs <= 1) return runSequential();
-
-        // 4. Jobs > 1 → parallel
-        return runParallel();
-    }
-
-private:
-    std::vector<std::string> order_;
-    std::set<std::string>    visited_;
-    std::set<std::string>    visiting_;
-
-    // ---- dependency graph traversal ----
-    void visit(const std::string& name) {
-        if (visited_.count(name)) return;
-        if (visiting_.count(name))
-            throw std::runtime_error("dependency cycle detected at task '" + name + "'");
-
-        auto it = g_tasks.find(name);
-        if (it == g_tasks.end())
-            throw std::runtime_error(
-                "task '" + name + "' not found (referenced as dependency)");
-
-        visiting_.insert(name);
-        for (const auto& d : it->second.depends) visit(d);
-        visiting_.erase(name);
-        visited_.insert(name);
-        order_.push_back(name);
-    }
-
-    // ---- helper: print task header ----
-    static void printHeader(const Task& t) {
-        std::cout << color::BLD() << color::CYN() << "> " << t.name
-                  << color::RST();
-        if (!t.desc.empty())
-            std::cout << "  " << color::DIM() << t.desc << color::RST();
-        std::cout << "\n";
-        std::cout.flush();
-    }
-
-    // ---- helper: run all commands of one task ----
-    // Returns exit code (0 = ok).
-    static int runCommands(const Task& t) {
-        if (t.runs.empty()) {
-            std::cout << color::DIM() << "  (no commands)\n" << color::RST();
-            return 0;
-        }
-        for (const auto& cmd : t.runs) {
-            std::cout << color::DIM() << "  $ " << color::RST() << cmd << "\n";
-            std::cout.flush();
-
-            int rc = std::system(cmd.c_str());
-            if (rc != 0) {
-                int code = (rc != -1 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : 1;
-                std::cerr << color::RED() << "x task '" << t.name
-                          << "' failed (exit " << code << ")\n" << color::RST();
-                return code ? code : 1;
-            }
-        }
-        return 0;
-    }
-
-    // ---- sequential: exactly like before ----
-    int runSequential() {
-        for (const auto& n : order_) {
-            const Task& t = g_tasks.at(n);
-            printHeader(t);
-            int rc = runCommands(t);
-            if (rc != 0) return rc;
-        }
-        return 0;
-    }
-
-    // ---- parallel: run tasks with no ready deps concurrently ----
-    int runParallel() {
-        // Build dependency count + reverse edges
-        std::map<std::string, int>              pending;   // name -> #unfinished deps
-        std::map<std::string, std::vector<std::string>> rev; // dep -> [dependents]
-
-        for (const auto& n : order_) {
-            const Task& t = g_tasks.at(n);
-            pending[n] = (int)t.depends.size();
-            for (const auto& d : t.depends)
-                rev[d].push_back(n);
-        }
-
-        std::mutex              mtx;
-        std::queue<std::string> ready;
-        std::atomic<int>        failed{0};
-        std::atomic<int>        running{0};
-        std::atomic<int>        done{0};
-        int total = (int)order_.size();
-
-        // Seed ready queue
-        for (const auto& n : order_)
-            if (pending[n] == 0) ready.push(n);
-
-        // Worker loop
-        std::vector<std::thread> workers;
-        int nWorkers = std::min(g_opt.jobs, total);
-
-        for (int w = 0; w < nWorkers; w++) {
-            workers.emplace_back([&] {
-                for (;;) {
-                    std::string name;
-                    {
-                        std::lock_guard<std::mutex> lk(mtx);
-                        if (ready.empty()) {
-                            if (done.load() == total) return;
-                            if (running.load() == 0) return;  // deadlock guard
-                            // no work right now; yield and retry
-                        }
-                        if (!ready.empty()) {
-                            name = ready.front();
-                            ready.pop();
-                        }
-                    }
-                    if (name.empty()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
-
-                    if (failed.load() > 0) return;   // stop scheduling new work
-
-                    running.fetch_add(1);
-                    const Task& t = g_tasks.at(name);
-
-                    {
-                        std::lock_guard<std::mutex> lk(mtx);
-                        printHeader(t);
-                    }
-                    int rc = runCommands(t);
-                    running.fetch_sub(1);
-                    done.fetch_add(1);
-
-                    if (rc != 0) {
-                        failed.store(rc);
-                        return;
-                    }
-
-                    std::lock_guard<std::mutex> lk(mtx);
-                    for (const auto& dependent : rev[name]) {
-                        if (--pending[dependent] == 0)
-                            ready.push(dependent);
-                    }
-                }
-            });
-        }
-
-        for (auto& w : workers) w.join();
-
-        if (failed.load() != 0) return failed.load();
-
-        // Detect unfinished tasks (shouldn't happen with cycle detection)
-        if (done.load() != total) {
-            std::cerr << color::RED() << "x execution stalled — "
-                      << (total - done.load()) << " task(s) unfinished\n"
-                      << color::RST();
-            return 1;
-        }
-        return 0;
-    }
-};
-
-// ============================================================
-//  CLI
+//  CLI: usage
 // ============================================================
 static void usage() {
-    std::cout <<
-        "birun " << VERSION << " - a tiny task runner (bi-powered)\n"
-        "\n"
-        "USAGE:\n"
-        "  birun <task>            Run a task (and its dependencies)\n"
-        "  birun --list,  -l       List available tasks\n"
-        "  birun --dry-run, -n     Show what would run, don't execute\n"
-        "  birun --jobs N, -j N    Run N tasks in parallel (default: 1)\n"
-        "  birun --file <path>     Use a specific config file\n"
-        "  birun --help,  -h       Show this help\n"
-        "  birun --version, -v     Print version\n"
-        "\n"
-        "CONFIG SYNTAX (birun.bi):\n"
-        "  route TASK \"/name\" {\n"
-        "      desc(\"Description\")\n"
-        "      depends(\"other\")\n"
-        "      run(\"shell command\")\n"
-        "  }\n"
-        "\n"
-        "  Logic is allowed: let / if / else / for / env()\n";
+    std::cout
+        << "  " << bold(accent("birun")) << " "
+        << rule(sym::dot()) << " "
+        << hint(std::string("v") + VERSION) << "\n"
+        << "  " << hint("a tiny task runner powered by the bi language") << "\n\n"
+
+        << "  " << bold(text("USAGE")) << "\n"
+        << "    " << accent("birun") << " " << hint("<task>") << "          Run a task (and its dependencies)\n"
+        << "    " << accent("birun") << " " << hint("-l, --list") << "      List available tasks\n"
+        << "    " << accent("birun") << " " << hint("-n, --dry-run") << "   Show what would run, don't execute\n"
+        << "    " << accent("birun") << " " << hint("-j, --jobs N") << "    Run N tasks in parallel (default: 1)\n"
+        << "    " << accent("birun") << " " << hint("-w, --watch") << "     Re-run on file changes\n"
+        << "    " << accent("birun") << " " << hint("--no-cache") << "        Disable caching\n"
+        << "    " << accent("birun") << " " << hint("--force") << "           Re-run even if cached (still refreshes cache)\n"
+        << "    " << accent("birun") << " " << hint("--clean") << "           Delete the cache file (then run, if a task is given)\n"
+        << "    " << accent("birun") << " " << hint("-q, --quiet") << "       Suppress all decoration, errors only\n"
+        << "    " << accent("birun") << " " << hint("--verbose") << "         Extra diagnostics (plan, cache, timing)\n"
+        << "    " << accent("birun") << " " << hint("-f, --file <p>") << "  Use a specific config file\n"
+        << "    " << accent("birun") << " " << hint("-h, --help") << "      Show this help\n"
+        << "    " << accent("birun") << " " << hint("-v, --version") << "   Print version\n\n"
+
+        << "  " << bold(text("INTEGRATION")) << "\n"
+        << "    " << accent("birun") << " " << hint("--json") << "          All tasks as JSON\n"
+        << "    " << accent("birun") << " " << hint("--json <task>") << "   Execution plan for <task> as JSON\n"
+        << "    " << accent("birun") << " " << hint("-n --json <task>") << " Same as above (explicit dry-run)\n"
+        << "    " << accent("birun") << " " << hint("--graph") << "         Print task graph as Graphviz DOT\n"
+        << "    " << accent("birun") << " " << hint("--completion") << " SH Print shell completion (bash|zsh|fish)\n"
+        << "    " << accent("birun") << " " << hint("--init") << "          Create a starter birun.bi\n\n"
+
+        << "  " << bold(text("TASK BUILTINS")) << "\n"
+        << "    " << info("desc") << "(\"...\")            Set description\n"
+        << "    " << info("depends") << "(\"a\", \"b\")      Declare dependencies\n"
+        << "    " << info("run") << "(\"cmd\")           Add a shell command\n"
+        << "    " << info("inputs") << "(\"src/*.cpp\")     Source globs (for caching)\n"
+        << "    " << info("outputs") << "(\"build/app\")     Expected outputs (for caching)\n\n"
+
+        << "  " << bold(text("SYSTEM BUILTINS")) << "\n"
+        << "    " << info("sh") << "(\"cmd\")              Run command, capture stdout\n"
+        << "    " << info("shStatus") << "(\"cmd\")          Exit code only\n"
+        << "    " << info("shFull") << "(\"cmd\")            {code, out, err}\n"
+        << "    " << info("which") << "(\"tool\")          Full path or null\n"
+        << "    " << info("exists") << "(\"path\")          bool\n"
+        << "    " << info("glob") << "(\"src/*.bi\")       List of paths\n"
+        << "    " << info("pkg") << "()                   Detect package manager\n"
+        << "    " << info("cwd") << "() / " << info("os") << "() / " << info("arch") << "()   Host info\n"
+        << "    " << info("inCI") << "() / " << info("env") << "(\"X\")      Environment\n\n"
+
+        << "  " << bold(text("CACHING")) << "\n"
+        << "    Tasks with " << info("inputs") << "() are skipped when their source files\n"
+        << "    are unchanged AND their " << info("outputs") << "() exist.\n"
+        << "    Cache key = commands + desc + depends + outputs + input content hash.\n"
+        << "    Cache file: " << hint(".birun/cache") << "  (override: " << hint("BIRUN_CACHE_FILE") << ")\n\n"
+
+        << "  " << bold(text("ENVIRONMENT")) << "\n"
+        << "    " << hint("BIRUN_ASCII=1") << "       Use ASCII symbols\n"
+        << "    " << hint("NO_COLOR=1") << "          Disable colors\n"
+        << "    " << hint("BIRUN_CACHE_FILE") << "    Path to cache file\n";
 }
 
+// ============================================================
+//  File I/O
+// ============================================================
 static std::string readFile(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) return "";
@@ -336,6 +111,9 @@ static std::string readFile(const std::string& p) {
     return ss.str();
 }
 
+// ============================================================
+//  CLI: --jobs parser
+// ============================================================
 static int parseJobs(const std::string& s) {
     try {
         int n = std::stoi(s);
@@ -347,10 +125,196 @@ static int parseJobs(const std::string& s) {
     }
 }
 
+// ============================================================
+//  Config loader
+// ============================================================
+static void loadConfig(const std::string& path) {
+    g_tasks.clear();
+    g_taskOrder.clear();
+
+    std::string src = readFile(path);
+    if (src.empty())
+        throw std::runtime_error("cannot read '" + path + "'");
+
+    Interpreter interp;
+    registerBirunBuiltins(interp.globals());
+    interp.runSource(src, path);
+
+    for (const auto& fn : interp.routes()) {
+        if (fn->routeMethod != "TASK")
+            throw std::runtime_error(
+                "unknown route method '" + fn->routeMethod +
+                "' — use `route TASK \"/name\" { ... }`");
+
+        std::string tname = fn->routePath;
+        if (!tname.empty() && tname[0] == '/') tname = tname.substr(1);
+        if (tname.empty())
+            throw std::runtime_error("task name cannot be empty");
+        if (g_tasks.count(tname))
+            throw std::runtime_error("duplicate task '" + tname + "'");
+
+        Task t;
+        t.name = tname;
+
+        Task* prev = g_currentTask;
+        g_currentTask = &t;
+        try {
+            ValueList noargs;
+            interp.call(vfunc(fn), noargs);
+        } catch (...) {
+            g_currentTask = prev;
+            throw;
+        }
+        g_currentTask = prev;
+
+        g_tasks.emplace(tname, std::move(t));
+        g_taskOrder.push_back(tname);
+    }
+}
+
+// ============================================================
+//  Print task list
+// ============================================================
+static void printList() {
+    if (g_taskOrder.empty()) {
+        std::cout << "  " << warn(sym::idle()) << " "
+                  << hint("no tasks in " + g_opt.file) << "\n";
+        return;
+    }
+
+    std::cout << "  " << bold(accent("birun")) << " "
+              << rule(sym::dot()) << " "
+              << text(g_opt.file) << "\n\n";
+
+    for (const auto& taskName : g_taskOrder) {
+        const Task& t = g_tasks.at(taskName);
+        std::cout << "  " << hint(sym::idle()) << " "
+                  << name(padName(taskName, 22));
+        if (!t.desc.empty()) std::cout << text(t.desc);
+        if (!t.depends.empty()) {
+            std::cout << "  " << rule(sym::arrow()) << " ";
+            for (size_t i = 0; i < t.depends.size(); i++) {
+                if (i) std::cout << rule(", ");
+                std::cout << hint(t.depends[i]);
+            }
+        }
+        if (!t.inputs.empty()) {
+            std::cout << "  " << rule("[cache]");
+        }
+        std::cout << "\n";
+    }
+}
+
+// ============================================================
+//  Run once
+// ============================================================
+static int runOnce() {
+    Executor ex(g_tasks, g_opt);
+    return ex.run(g_opt.task);
+}
+
+// ============================================================
+//  Watch mode
+// ============================================================
+static int runWatchMode() {
+    const std::string& cfgFile = g_opt.file;
+    std::vector<std::string> roots = { cfgFile, "." };
+
+    std::signal(SIGINT, [](int) {
+        std::cout << "\n  " << warn("stopped") << "\n";
+        std::_Exit(0);
+    });
+
+    std::cout << "  " << bold(accent("birun")) << " "
+              << rule(sym::dot()) << " "
+              << text("watch") << " "
+              << hint(cfgFile) << " "
+              << rule(sym::dot()) << " "
+              << hint("Ctrl-C to stop") << "\n\n";
+
+    auto lastSnap = birun::watch::snapshot(roots);
+    try {
+        runOnce();
+    } catch (std::exception& e) {
+        std::cerr << "  " << danger(sym::fail()) << " "
+                  << danger(e.what()) << "\n";
+    }
+
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+        auto nowSnap = birun::watch::snapshot(roots);
+        auto changed = birun::watch::diff(lastSnap, nowSnap);
+        if (changed.empty()) continue;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto settled = birun::watch::snapshot(roots);
+        changed = birun::watch::diff(lastSnap, settled);
+        lastSnap = std::move(settled);
+
+        std::cout << "\n  " << warn(sym::spark()) << " "
+                  << warn("change detected") << " "
+                  << rule(sym::dot()) << " "
+                  << hint(std::to_string(changed.size()) + " file(s)") << "\n";
+        for (size_t i = 0; i < changed.size() && i < 5; i++)
+            std::cout << "      " << rule(sym::bullet()) << " "
+                      << hint(changed[i]) << "\n";
+        if (changed.size() > 5)
+            std::cout << "      " << rule(sym::bullet()) << " "
+                      << hint("... and " +
+                              std::to_string(changed.size() - 5) + " more")
+                      << "\n";
+        std::cout << "\n";
+
+        try {
+            loadConfig(g_opt.file);
+        } catch (std::exception& e) {
+            std::cerr << "  " << danger(sym::fail()) << " "
+                      << danger(std::string("config error: ") + e.what())
+                      << "\n";
+            continue;
+        }
+
+        try {
+            runOnce();
+        } catch (std::exception& e) {
+            std::cerr << "  " << danger(sym::fail()) << " "
+                      << danger(e.what()) << "\n";
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+//  main
+// ============================================================
+// ============================================================
+//  main
+// ============================================================
 int main(int argc, char** argv) {
     try {
         for (int i = 1; i < argc; i++) {
             std::string a = argv[i];
+
+            // ---- combined short forms: -jN, -fPATH ----
+            if (a.size() > 2 && a[0] == '-' && a[1] == 'j') {
+                g_opt.jobs = parseJobs(a.substr(2));
+                continue;
+            }
+            if (a.size() > 2 && a[0] == '-' && a[1] == 'f') {
+                g_opt.file = a.substr(2);
+                continue;
+            }
+            // ---- long form with '=': --jobs=N, --file=PATH ----
+            if (a.rfind("--jobs=", 0) == 0) {
+                g_opt.jobs = parseJobs(a.substr(7));
+                continue;
+            }
+            if (a.rfind("--file=", 0) == 0) {
+                g_opt.file = a.substr(7);
+                continue;
+            }
+
             if (a == "--help" || a == "-h")    { usage(); return 0; }
             if (a == "--version" || a == "-v") {
                 std::cout << "birun " << VERSION << "\n";
@@ -358,6 +322,31 @@ int main(int argc, char** argv) {
             }
             if (a == "--list" || a == "-l")    { g_opt.list = true; continue; }
             if (a == "--dry-run" || a == "-n") { g_opt.dryRun = true; continue; }
+            if (a == "--watch" || a == "-w")   { g_opt.watch = true; continue; }
+            if (a == "--no-cache")             { g_opt.noCache = true; continue; }
+            if (a == "--force" || a == "-F")   { g_opt.force = true; continue; }
+            if (a == "--clean")                { g_opt.clean = true; continue; }
+            if (a == "--json")                 { g_jsonMode = true; continue; }
+            if (a == "--graph")                { g_graphMode = true; continue; }
+            if (a == "--init")                 { g_initMode = true; continue; }
+            if (a == "--force-init")           { g_initForce = true; continue; }
+
+            if (a == "--quiet" || a == "-q") {
+                g_opt.verbosity = Verbosity::Quiet;
+                continue;
+            }
+            if (a == "--verbose") {
+                g_opt.verbosity = Verbosity::Verbose;
+                continue;
+            }
+
+            if (a == "--completion") {
+                if (i + 1 >= argc)
+                    throw std::runtime_error(
+                        "--completion requires a shell (bash|zsh|fish)");
+                g_completionShell = argv[++i];
+                continue;
+            }
             if (a == "--jobs" || a == "-j") {
                 if (i + 1 >= argc)
                     throw std::runtime_error("--jobs requires a number");
@@ -377,87 +366,89 @@ int main(int argc, char** argv) {
             else throw std::runtime_error("too many arguments");
         }
 
-        color::enabled = isatty(fileno(stdout)) != 0;
+        birun::theme::detect();
 
-        std::string src = readFile(g_opt.file);
-        if (src.empty())
-            throw std::runtime_error("cannot read '" + g_opt.file + "'");
-
-        // ---- Load config through bi ----
-        Interpreter interp;
-        registerBirunBuiltins(interp.globals());
-        interp.runSource(src, g_opt.file);
-
-        // ---- Convert routes -> tasks ----
-        for (const auto& fn : interp.routes()) {
-            if (fn->routeMethod != "TASK")
-                throw std::runtime_error(
-                    "unknown route method '" + fn->routeMethod +
-                    "' — use `route TASK \"/name\" { ... }`");
-
-            std::string name = fn->routePath;
-            if (!name.empty() && name[0] == '/') name = name.substr(1);
-            if (name.empty())
-                throw std::runtime_error("task name cannot be empty");
-            if (g_tasks.count(name))
-                throw std::runtime_error("duplicate task '" + name + "'");
-
-            Task t;
-            t.name = name;
-
-            Task* prev = g_current;
-            g_current = &t;
-            try {
-                ValueList noargs;
-                interp.call(vfunc(fn), noargs);
-            } catch (...) {
-                g_current = prev;
-                throw;
-            }
-            g_current = prev;
-
-            g_tasks.emplace(name, std::move(t));
-            g_taskOrder.push_back(name);
+        if (g_initMode) {
+            bool ok = birun::extras::writeStarter(g_opt.file, g_initForce);
+            return ok ? 0 : 1;
         }
 
-        // ---- List / run ----
-        if (g_opt.list || g_opt.task.empty()) {
-            if (g_taskOrder.empty()) {
-                std::cout << "birun: no tasks in " << g_opt.file << "\n";
-                return 0;
-            }
-            std::cout << color::BLD() << "Tasks in " << g_opt.file << ":\n"
-                      << color::RST();
-            for (const auto& name : g_taskOrder) {
-                const Task& t = g_tasks.at(name);
-                std::cout << "  " << color::CYN() << name << color::RST();
-                size_t pad = (name.size() < 20) ? 20 - name.size() : 1;
-                std::cout << std::string(pad, ' ');
-                if (!t.desc.empty()) std::cout << t.desc;
-                if (!t.depends.empty()) {
-                    std::cout << " " << color::DIM() << "(depends:";
-                    for (const auto& d : t.depends) std::cout << " " << d;
-                    std::cout << ")" << color::RST();
+        if (g_opt.clean) {
+            bool removed = birun::cache::cleanCache();
+            if (g_opt.verbosity != Verbosity::Quiet) {
+                if (removed) {
+                    std::cout << "  " << success(sym::ok()) << " "
+                              << text("cache cleared") << " "
+                              << rule(sym::dot()) << " "
+                              << hint(birun::cache::cacheFilePath()) << "\n";
+                } else {
+                    std::cout << "  " << hint(sym::idle()) << " "
+                              << hint("no cache to clear") << " "
+                              << rule(sym::dot()) << " "
+                              << hint(birun::cache::cacheFilePath()) << "\n";
                 }
-                std::cout << "\n";
             }
-            if (g_opt.task.empty() && !g_opt.list)
-                std::cout << "\nRun 'birun <task>' to execute a task.\n";
+            if (g_opt.task.empty()) return 0;
+        }
+
+        loadConfig(g_opt.file);
+
+        if (g_jsonMode) {
+            if (!g_opt.task.empty()) {
+                Executor ex(g_tasks, g_opt);
+                auto order = ex.plan(g_opt.task);
+                birun::extras::printPlanJson(
+                    g_tasks, order, g_opt.task, g_opt.file, g_opt.jobs);
+            } else {
+                birun::extras::printJson(
+                    g_tasks, g_taskOrder, g_opt.file, VERSION);
+            }
             return 0;
         }
 
-        Executor ex;
-        return ex.run(g_opt.task);
+        if (g_graphMode) {
+            birun::extras::printGraph(g_tasks, g_taskOrder, g_opt.file);
+            return 0;
+        }
+        if (!g_completionShell.empty()) {
+            birun::extras::printCompletion(g_completionShell, g_taskOrder);
+            return 0;
+        }
+
+        if (g_opt.watch && g_opt.task.empty())
+            throw std::runtime_error(
+                "--watch requires a task name, e.g. `birun --watch test`");
+
+        if (g_opt.list || (!g_opt.watch && g_opt.task.empty())) {
+            printList();
+            if (!g_opt.watch && g_opt.task.empty() && !g_opt.list)
+                std::cout << "\n  "
+                          << hint("run 'birun <task>' to execute a task") << "\n";
+            return 0;
+        }
+
+        if (g_opt.watch)
+            return runWatchMode();
+
+        return runOnce();
 
     } catch (ServeSignal&) {
-        std::cerr << "birun: serve() is not allowed in birun.bi\n";
+        std::cerr << "  " << danger(sym::fail()) << " "
+                  << danger("serve() is not allowed in birun.bi") << "\n";
         return 1;
     } catch (BiError& e) {
-        std::cerr << "birun: " << (e.file.empty() ? g_opt.file : e.file)
-                  << ":" << e.line << ":" << e.col << ": " << e.what() << "\n";
+        std::cerr << "  " << danger(sym::fail()) << " "
+                  << danger((e.file.empty() ? g_opt.file : e.file) +
+                            ":" + std::to_string(e.line) +
+                            ":" + std::to_string(e.col)) << "\n"
+                  << "      " << text(e.what()) << "\n";
         return 1;
     } catch (std::exception& e) {
-        std::cerr << color::RED() << "birun: " << e.what() << color::RST() << "\n";
+        std::cerr << "  " << danger(sym::fail()) << " "
+                  << danger(e.what()) << "\n";
         return 1;
     }
 }
+// ============================================================
+//  END OF FILE
+// ============================================================

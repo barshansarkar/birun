@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ------------------------------------------------------------
+  # Fast gate: build + test across OS × compiler × build type
+  # ------------------------------------------------------------
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+        exclude:
+          - os: macos-latest
+            compiler: gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ------------------------------------------------------------
+  # Sanitizers (Linux only — fast & cheap to gate on)
+  # ------------------------------------------------------------
+  sanitizers:
+    name: ASAN+UBSAN
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  # ------------------------------------------------------------
+  # Static analysis
+  # ------------------------------------------------------------
+  static-analysis:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,performance \
+                   --suppress=missingIncludeSystem \
+                   --error-exitcode=1 \
+                   -I src -I vendor \
+                   src tests
