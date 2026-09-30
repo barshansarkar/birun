@@ -2,23 +2,43 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_GENERATOR: Ninja
+  CTEST_OUTPUT_ON_FAILURE: 1
+  CATCH2_VERSION: v3.5.4
+
 jobs:
+
+  # ============================================================
+  #  Build + test on Linux (gcc, clang) and macOS (clang)
+  # ============================================================
   build-and-test:
     name: build / ${{ matrix.os }} / ${{ matrix.compiler }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        compiler: [gcc, clang]
-        exclude:
-          - os: macos-latest
+        include:
+          - os: ubuntu-latest
             compiler: gcc
+          - os: ubuntu-latest
+            compiler: clang
+          - os: macos-latest
+            compiler: clang
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,20 +47,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build cmake git
-          git clone --depth 1 --branch v3.5.4 https://github.com/catchorg/Catch2.git /tmp/catch2
-          cmake -S /tmp/catch2 -B /tmp/catch2/build -DCMAKE_BUILD_TYPE=Release -DCATCH_BUILD_TESTING=OFF
-          sudo cmake --install /tmp/catch2/build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
+        run: brew install ninja cmake
+
+      - name: Build and install Catch2 v3
         run: |
-          brew install ninja cmake catch2
+          git clone --depth 1 --branch "${CATCH2_VERSION}" \
+            https://github.com/catchorg/Catch2.git /tmp/catch2
+          cmake -S /tmp/catch2 -B /tmp/catch2/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCATCH_BUILD_TESTING=OFF \
+            -DCATCH_INSTALL_DOCS=OFF \
+            -DCATCH_INSTALL_EXTRAS=OFF
+          cmake --build /tmp/catch2/build --parallel
+          sudo cmake --install /tmp/catch2/build
 
       - name: Configure
         env:
           CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
           CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=ON
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBIRUN_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --parallel
@@ -48,12 +82,18 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # ============================================================
+  #  Smoke test — end-to-end user workflow (no tests, faster)
+  # ============================================================
   smoke:
     name: smoke / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -67,12 +107,25 @@ jobs:
 
       - name: Build (no tests)
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=OFF
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBIRUN_BUILD_TESTS=OFF
           cmake --build build --parallel
 
-      - name: Smoke test
+      - name: Version check
+        run: ./build/birun --version
+
+      - name: Init + list + run
         run: |
-          ./build/birun --version
           mkdir -p /tmp/smoke && cd /tmp/smoke
           "$GITHUB_WORKSPACE/build/birun" --init
+          test -f birun.bi
           "$GITHUB_WORKSPACE/build/birun" --list
+          "$GITHUB_WORKSPACE/build/birun" hello
+
+      - name: JSON output well-formed
+        run: |
+          cd /tmp/smoke
+          "$GITHUB_WORKSPACE/build/birun" --json > out.json
+          python3 -c "import json; json.load(open('out.json'))"
+          echo "PASS: valid JSON"
