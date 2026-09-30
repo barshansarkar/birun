@@ -1,19 +1,8 @@
 # ============================================================
 #  birun · tests/CMakeLists.txt
 #  Catch2 v3 based test suite.
-#
-#  Discovery strategy (in order):
-#    1. Prefer a system-installed Catch2 v3 (find_package).
-#    2. Fall back to FetchContent from GitHub if not found.
-#
-#  This makes the suite build on:
-#    - Ubuntu/Debian (after cmake --install Catch2)
-#    - macOS (Homebrew catch2)
-#    - Windows (vcpkg or FetchContent fallback)
-#    - CI runners without any pre-installed Catch2
 # ============================================================
 
-# ---- Locate Catch2 v3, or fetch it ------------------------------
 list(APPEND CMAKE_PREFIX_PATH "/usr/local" "/opt/homebrew")
 
 find_package(Catch2 3 QUIET)
@@ -29,21 +18,20 @@ if(NOT Catch2_FOUND)
         GIT_SHALLOW    TRUE
     )
 
-    # Only build the library, not Catch2's own tests.
-    set(CATCH_BUILD_TESTING     OFF CACHE BOOL "" FORCE)
-    set(CATCH_INSTALL_DOCS      OFF CACHE BOOL "" FORCE)
-    set(CATCH_INSTALL_EXTRAS    OFF CACHE BOOL "" FORCE)
+    set(CATCH_BUILD_TESTING  OFF CACHE BOOL "" FORCE)
+    set(CATCH_INSTALL_DOCS   OFF CACHE BOOL "" FORCE)
+    set(CATCH_INSTALL_EXTRAS OFF CACHE BOOL "" FORCE)
 
     FetchContent_MakeAvailable(Catch2)
+
+    # FetchContent sets Catch2_DIR itself
+    set(BIRUN_CATCH_CMAKE_DIR "${Catch2_DIR}")
 else()
     message(STATUS "Found Catch2 v3 at: ${Catch2_DIR}")
-
-    # v3 installs its CMake helpers under ${Catch2_DIR}.
-    # Add that to the module path so `include(Catch)` resolves.
-    list(APPEND CMAKE_MODULE_PATH "${Catch2_DIR}")
+    set(BIRUN_CATCH_CMAKE_DIR "${Catch2_DIR}")
 endif()
 
-# ---- Test executable -------------------------------------------
+# ---- Test executable ------------------------------------------
 add_executable(birun_tests
     test_builtins.cpp
     test_cache.cpp
@@ -59,11 +47,10 @@ target_link_libraries(birun_tests PRIVATE
 
 target_compile_options(birun_tests PRIVATE -Wall -Wextra)
 
-# ---- Test discovery --------------------------------------------
-# `include(Catch)` brings in `catch_discover_tests`.
-# Works for both find_package (after CMAKE_MODULE_PATH tweak)
-# and FetchContent (which sets CMAKE_MODULE_PATH itself).
-include(Catch)
+# ---- Test discovery -------------------------------------------
+# Explicit absolute include — bypasses any module-path ordering issues.
+include("${BIRUN_CATCH_CMAKE_DIR}/Catch.cmake")
+
 catch_discover_tests(birun_tests
     TEST_PREFIX ""
     TEST_SUFFIX ""
