@@ -1,8 +1,20 @@
-build/
+# Build
+/build/
+/build-test/
 *.o
-*.out
-birun
+*.a
+*.so
+*.dylib
+
+# birun cache
+.birun/
+
+# Editor
+.vscode/
+.idea/
 *.swp
+*~
+
+# OS
 .DS_Store
-*.orig
-dist/
+Thumbs.db

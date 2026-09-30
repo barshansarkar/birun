@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+          - os: macos-13
+            target: darwin-x86_64
+          - os: macos-14
+            target: darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBIRUN_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="birun-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp build/birun "dist/$NAME/birun"
+          cp README.md LICENSE "dist/$NAME/" 2>/dev/null || true
+          tar -czf "dist/${NAME}.tar.gz" -C dist "$NAME"
+          echo "ASSET=dist/${NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: birun-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
