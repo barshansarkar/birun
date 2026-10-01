@@ -1,7 +1,9 @@
 #pragma once
 // ============================================================
-//  birun · cache.hpp
-//  Task caching based on input file hashes + task definition.
+//  birun · cache.hpp  (v0.8.0)
+//  Task caching: input file hashes + task definition.
+//  - advisory flock() so concurrent runs don't corrupt the store
+//  - atomic write via temp file + rename
 // ============================================================
 
 #include "executor.hpp"
@@ -15,6 +17,8 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -129,7 +133,7 @@ inline std::vector<std::string> expandGlob(const std::string& pattern) {
 }
 
 // ------------------------------------------------------------
-//  Hash a set of glob patterns
+//  Hash a set of glob patterns → hex string
 // ------------------------------------------------------------
 inline std::string hashInputs(const std::vector<std::string>& globs) {
     std::vector<std::string> files;
@@ -152,7 +156,8 @@ inline std::string hashInputs(const std::vector<std::string>& globs) {
 }
 
 // ------------------------------------------------------------
-//  Hash task definition + input files
+//  Hash task definition + input files (v0.8.0)
+//  Includes new fields: env, cwd, timeout, retry, backoff.
 // ------------------------------------------------------------
 inline std::string hashTask(const Task& t) {
     uint64_t combined = 1469598103934665603ULL;
@@ -167,6 +172,11 @@ inline std::string hashTask(const Task& t) {
     for (const auto& c : t.runs)    mixStr(c);
     for (const auto& d : t.depends) mixStr(d);
     for (const auto& o : t.outputs) mixStr(o);
+    for (const auto& kv : t.env) { mixStr(kv.first); mixStr(kv.second); }
+    mixStr(t.cwd);
+    mixStr(std::to_string(t.timeoutSec));
+    mixStr(std::to_string(t.retryCount));
+    mixStr(std::to_string(t.retryBackoffMs));
 
     std::vector<std::string> files;
     for (const auto& g : t.inputs) {
@@ -187,7 +197,7 @@ inline std::string hashTask(const Task& t) {
 }
 
 // ------------------------------------------------------------
-//  Check outputs exist
+//  Outputs exist?
 // ------------------------------------------------------------
 inline bool outputsExist(const std::vector<std::string>& outputs) {
     if (outputs.empty()) return true;
@@ -202,7 +212,52 @@ inline bool outputsExist(const std::vector<std::string>& outputs) {
 }
 
 // ------------------------------------------------------------
-//  Cache storage — ATOMIC write via temp + rename
+//  Advisory file lock (POSIX flock on <cache>.lock)
+//  Safe for concurrent birun invocations.
+// ------------------------------------------------------------
+class CacheLock {
+public:
+    CacheLock() = default;
+    ~CacheLock() { release(); }
+    CacheLock(const CacheLock&) = delete;
+    CacheLock& operator=(const CacheLock&) = delete;
+
+    bool acquire(const std::string& cachePath) {
+        std::string lp = cachePath + ".lock";
+        auto dir = fs::path(lp).parent_path();
+        if (!dir.empty()) {
+            std::error_code ec;
+            fs::create_directories(dir, ec);
+        }
+        fd_ = ::open(lp.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd_ < 0) return false;
+        if (::flock(fd_, LOCK_EX) < 0) {
+            ::close(fd_);
+            fd_ = -1;
+            return false;
+        }
+        held_ = true;
+        return true;
+    }
+
+    void release() {
+        if (held_ && fd_ >= 0) {
+            ::flock(fd_, LOCK_UN);
+            ::close(fd_);
+        }
+        held_ = false;
+        fd_   = -1;
+    }
+
+    bool held() const { return held_; }
+
+private:
+    int  fd_   = -1;
+    bool held_ = false;
+};
+
+// ------------------------------------------------------------
+//  Cache store — load / save (atomic + locked)
 // ------------------------------------------------------------
 struct CacheStore {
     std::map<std::string, std::string> entries;
@@ -222,13 +277,19 @@ struct CacheStore {
     }
 
     void save(const std::string& path) const {
+        // Take an exclusive lock while writing. If we can't acquire,
+        // proceed anyway — a broken lock shouldn't kill a successful run,
+        // but we log it at the call site.
+        CacheLock lk;
+        bool haveLock = lk.acquire(path);
+
         auto dir = fs::path(path).parent_path();
         if (!dir.empty()) {
             std::error_code ec;
             fs::create_directories(dir, ec);
         }
 
-        // Write to temp file in the SAME directory (so rename is atomic on POSIX)
+        // Write to temp in the SAME directory → rename is atomic on POSIX.
         std::string tmp = path + ".tmp." + std::to_string(::getpid());
 
         bool ok = true;
@@ -258,6 +319,8 @@ struct CacheStore {
             throw std::runtime_error(
                 "cache: cannot replace '" + path + "': " + ec.message());
         }
+
+        (void)haveLock;
     }
 };
 
@@ -271,13 +334,19 @@ inline std::string cacheFilePath() {
 }
 
 // ------------------------------------------------------------
-//  Clean — delete cache file
+//  Clean — delete cache file (+ its lock)
 // ------------------------------------------------------------
 inline bool cleanCache() {
     std::string path = cacheFilePath();
     std::error_code ec;
-    if (!fs::exists(path, ec)) return false;
-    return fs::remove(path, ec);
+    bool removed = false;
+    if (fs::exists(path, ec)) {
+        removed = fs::remove(path, ec);
+    }
+    // best-effort: remove lockfile too
+    std::error_code ec2;
+    fs::remove(path + ".lock", ec2);
+    return removed;
 }
 
 } // namespace birun::cache

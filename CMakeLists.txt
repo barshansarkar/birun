@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(birun VERSION 0.7.0 LANGUAGES CXX)
+project(birun VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,8 +30,14 @@ target_compile_definitions(birun PRIVATE
 install(TARGETS birun RUNTIME DESTINATION bin)
 
 # ---- tests ----
-# option(BIRUN_BUILD_TESTS "Build birun tests" ON)
-# if(BIRUN_BUILD_TESTS)
-#     enable_testing()
-#     add_subdirectory(tests)
-# endif()
+# ---- tests ----
+option(BIRUN_BUILD_TESTS "Build birun tests" OFF)
+if(BIRUN_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+target_compile_options(birun_tests PRIVATE
+    -Wall -Wextra
+    -Wno-missing-field-initializers   # <-- NEW
+)

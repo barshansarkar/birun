@@ -5,7 +5,7 @@
 #include "cache.hpp"
 #include "executor.hpp"
 #include "extras.hpp"
-#include "proc.hpp"          // <-- NEW: signal handling + process groups
+#include "proc.hpp"
 #include "theme.hpp"
 #include "watch.hpp"
 
@@ -61,8 +61,12 @@ static void usage() {
         << "    " << accent("birun") << " " << hint("--no-cache") << "        Disable caching\n"
         << "    " << accent("birun") << " " << hint("--force") << "           Re-run even if cached (still refreshes cache)\n"
         << "    " << accent("birun") << " " << hint("--clean") << "           Delete the cache file (then run, if a task is given)\n"
-        << "    " << accent("birun") << " " << hint("-q, --quiet") << "       Suppress all decoration, errors only\n"
+        << "    " << accent("birun") << " " << hint("-q, --quiet") << "       Suppress decoration, errors only\n"
+        << "    " << accent("birun") << " " << hint("-qq, --silent") << "     Absolute silence (exit code only)\n"
         << "    " << accent("birun") << " " << hint("--verbose") << "         Extra diagnostics (plan, cache, timing)\n"
+        << "    " << accent("birun") << " " << hint("--stats") << "           Per-task timings + cache hit ratio\n"
+        << "    " << accent("birun") << " " << hint("--explain") << "         Explain why each task ran\n"
+        << "    " << accent("birun") << " " << hint("--grace N") << "         SIGTERM→SIGKILL grace seconds (default: 3)\n"
         << "    " << accent("birun") << " " << hint("-f, --file <p>") << "  Use a specific config file\n"
         << "    " << accent("birun") << " " << hint("-h, --help") << "      Show this help\n"
         << "    " << accent("birun") << " " << hint("-v, --version") << "   Print version\n\n"
@@ -70,9 +74,8 @@ static void usage() {
         << "  " << bold(text("INTEGRATION")) << "\n"
         << "    " << accent("birun") << " " << hint("--json") << "          All tasks as JSON\n"
         << "    " << accent("birun") << " " << hint("--json <task>") << "   Execution plan for <task> as JSON\n"
-        << "    " << accent("birun") << " " << hint("-n --json <task>") << " Same as above (explicit dry-run)\n"
         << "    " << accent("birun") << " " << hint("--graph") << "         Print task graph as Graphviz DOT\n"
-        << "    " << accent("birun") << " " << hint("--completion") << " SH Print shell completion (bash|zsh|fish)\n"
+        << "    " << accent("birun") << " " << hint("--completion SH") << " Shell completion (bash|zsh|fish)\n"
         << "    " << accent("birun") << " " << hint("--init") << "          Create a starter birun.bi\n\n"
 
         << "  " << bold(text("TASK BUILTINS")) << "\n"
@@ -80,12 +83,16 @@ static void usage() {
         << "    " << info("depends") << "(\"a\", \"b\")      Declare dependencies\n"
         << "    " << info("run") << "(\"cmd\")           Add a shell command\n"
         << "    " << info("inputs") << "(\"src/*.cpp\")     Source globs (for caching)\n"
-        << "    " << info("outputs") << "(\"build/app\")     Expected outputs (for caching)\n\n"
+        << "    " << info("outputs") << "(\"build/app\")     Expected outputs (for caching)\n"
+        << "    " << info("timeout") << "(sec)             Kill task's commands after N seconds\n"
+        << "    " << info("retry") << "(n, backoffMs)      Retry the whole task up to n+1 times\n"
+        << "    " << info("env") << "(\"K\", \"V\")         Per-task environment variable\n"
+        << "    " << info("cwd") << "(\"path\")           Per-task working directory\n\n"
 
         << "  " << bold(text("SYSTEM BUILTINS")) << "\n"
         << "    " << info("sh") << "(\"cmd\")              Run command, capture stdout\n"
         << "    " << info("shStatus") << "(\"cmd\")          Exit code only\n"
-        << "    " << info("shFull") << "(\"cmd\")            {code, out, err}\n"
+        << "    " << info("shFull") << "(\"cmd\")            {code, out, err, timedOut}\n"
         << "    " << info("which") << "(\"tool\")          Full path or null\n"
         << "    " << info("exists") << "(\"path\")          bool\n"
         << "    " << info("glob") << "(\"src/*.bi\")       List of paths\n"
@@ -96,8 +103,10 @@ static void usage() {
         << "  " << bold(text("CACHING")) << "\n"
         << "    Tasks with " << info("inputs") << "() are skipped when their source files\n"
         << "    are unchanged AND their " << info("outputs") << "() exist.\n"
-        << "    Cache key = commands + desc + depends + outputs + input content hash.\n"
-        << "    Cache file: " << hint(".birun/cache") << "  (override: " << hint("BIRUN_CACHE_FILE") << ")\n\n"
+        << "    Cache key = commands + desc + depends + outputs + env + cwd\n"
+        << "                 + timeout + retry + input content hash.\n"
+        << "    Cache file: " << hint(".birun/cache") << "  (override: " << hint("BIRUN_CACHE_FILE") << ")\n"
+        << "    Concurrent runs are safe — writes are flock()-protected.\n\n"
 
         << "  " << bold(text("ENVIRONMENT")) << "\n"
         << "    " << hint("BIRUN_ASCII=1") << "       Use ASCII symbols\n"
@@ -181,6 +190,7 @@ static void loadConfig(const std::string& path) {
 //  Print task list
 // ============================================================
 static void printList() {
+    if (g_opt.silent) return;
     if (g_taskOrder.empty()) {
         std::cout << "  " << warn(sym::idle()) << " "
                   << hint("no tasks in " + g_opt.file) << "\n";
@@ -206,6 +216,12 @@ static void printList() {
         if (!t.inputs.empty()) {
             std::cout << "  " << rule("[cache]");
         }
+        if (t.timeoutSec > 0)
+            std::cout << "  " << rule("[timeout " +
+                                      std::to_string(t.timeoutSec) + "s]");
+        if (t.retryCount > 0)
+            std::cout << "  " << rule("[retry " +
+                                      std::to_string(t.retryCount) + "]");
         std::cout << "\n";
     }
 }
@@ -220,10 +236,9 @@ static int runOnce() {
 
 // ============================================================
 //  Watch mode
-//    Signal handling is done by proc::installSignalHandlers()
-//    (called once in main). Here we only check the shutdown flag.
 // ============================================================
 static int runWatchMode() {
+    if (g_opt.silent) return 0;   // silent watch makes no sense
     const std::string& cfgFile = g_opt.file;
     std::vector<std::string> roots = { cfgFile, "." };
 
@@ -314,13 +329,20 @@ int main(int argc, char** argv) {
                 g_opt.file = a.substr(2);
                 continue;
             }
-            // ---- long form with '=': --jobs=N, --file=PATH ----
+            // ---- long form with '=': --jobs=N, --file=PATH, --grace=N ----
             if (a.rfind("--jobs=", 0) == 0) {
                 g_opt.jobs = parseJobs(a.substr(7));
                 continue;
             }
             if (a.rfind("--file=", 0) == 0) {
                 g_opt.file = a.substr(7);
+                continue;
+            }
+            if (a.rfind("--grace=", 0) == 0) {
+                int s = std::stoi(a.substr(8));
+                if (s < 0) s = 0;
+                if (s > 60) s = 60;
+                g_opt.graceSec = s;
                 continue;
             }
 
@@ -339,8 +361,15 @@ int main(int argc, char** argv) {
             if (a == "--graph")                { g_graphMode = true; continue; }
             if (a == "--init")                 { g_initMode = true; continue; }
             if (a == "--force-init")           { g_initForce = true; continue; }
+            if (a == "--stats")                { g_opt.stats = true; continue; }
+            if (a == "--explain")              { g_opt.explain = true; continue; }
 
             if (a == "--quiet" || a == "-q") {
+                g_opt.verbosity = Verbosity::Quiet;
+                continue;
+            }
+            if (a == "-qq" || a == "--silent") {
+                g_opt.silent = true;
                 g_opt.verbosity = Verbosity::Quiet;
                 continue;
             }
@@ -368,6 +397,15 @@ int main(int argc, char** argv) {
                 g_opt.file = argv[++i];
                 continue;
             }
+            if (a == "--grace") {
+                if (i + 1 >= argc)
+                    throw std::runtime_error("--grace requires a number");
+                int s = std::stoi(argv[++i]);
+                if (s < 0) s = 0;
+                if (s > 60) s = 60;
+                g_opt.graceSec = s;
+                continue;
+            }
             if (!a.empty() && a[0] == '-')
                 throw std::runtime_error("unknown option '" + a + "'");
 
@@ -384,7 +422,7 @@ int main(int argc, char** argv) {
 
         if (g_opt.clean) {
             bool removed = birun::cache::cleanCache();
-            if (g_opt.verbosity != Verbosity::Quiet) {
+            if (!g_opt.silent && g_opt.verbosity != Verbosity::Quiet) {
                 if (removed) {
                     std::cout << "  " << success(sym::ok()) << " "
                               << text("cache cleared") << " "
@@ -430,7 +468,7 @@ int main(int argc, char** argv) {
 
         if (g_opt.list || (!g_opt.watch && g_opt.task.empty())) {
             printList();
-            if (!g_opt.watch && g_opt.task.empty() && !g_opt.list)
+            if (!g_opt.silent && !g_opt.watch && g_opt.task.empty() && !g_opt.list)
                 std::cout << "\n  "
                           << hint("run 'birun <task>' to execute a task") << "\n";
             return 0;
@@ -442,19 +480,22 @@ int main(int argc, char** argv) {
         return runOnce();
 
     } catch (ServeSignal&) {
-        std::cerr << "  " << danger(sym::fail()) << " "
-                  << danger("serve() is not allowed in birun.bi") << "\n";
+        if (!g_opt.silent)
+            std::cerr << "  " << danger(sym::fail()) << " "
+                      << danger("serve() is not allowed in birun.bi") << "\n";
         return 1;
     } catch (BiError& e) {
-        std::cerr << "  " << danger(sym::fail()) << " "
-                  << danger((e.file.empty() ? g_opt.file : e.file) +
-                            ":" + std::to_string(e.line) +
-                            ":" + std::to_string(e.col)) << "\n"
-                  << "      " << text(e.what()) << "\n";
+        if (!g_opt.silent)
+            std::cerr << "  " << danger(sym::fail()) << " "
+                      << danger((e.file.empty() ? g_opt.file : e.file) +
+                                ":" + std::to_string(e.line) +
+                                ":" + std::to_string(e.col)) << "\n"
+                      << "      " << text(e.what()) << "\n";
         return 1;
     } catch (std::exception& e) {
-        std::cerr << "  " << danger(sym::fail()) << " "
-                  << danger(e.what()) << "\n";
+        if (!g_opt.silent)
+            std::cerr << "  " << danger(sym::fail()) << " "
+                      << danger(e.what()) << "\n";
         return 1;
     }
 }

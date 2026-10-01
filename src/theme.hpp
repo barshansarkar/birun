@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================
-//  birun · theme.hpp
+//  birun · theme.hpp  (v0.8.0)
 //  Professional terminal theme (Tokyo Night inspired).
 //
 //  Auto-detects capability:
@@ -33,15 +33,19 @@ inline void detect() {
     const char* ct   = std::getenv("COLORTERM");
     const char* term = std::getenv("TERM");
 
-    if (ct && (std::strcmp(ct, "truecolor") == 0 ||
-               std::strcmp(ct, "24bit")    == 0))
-        g_level = Level::TrueColor;
-    else if (term && std::strstr(term, "256color"))
-        g_level = Level::Ansi256;
-    else if (isatty(fileno(stdout)))
-        g_level = Level::Basic;
-    else
+    // NO_COLOR disables everything
+    if (std::getenv("NO_COLOR")) {
         g_level = Level::None;
+    } else if (ct && (std::strcmp(ct, "truecolor") == 0 ||
+                      std::strcmp(ct, "24bit")     == 0)) {
+        g_level = Level::TrueColor;
+    } else if (term && std::strstr(term, "256color")) {
+        g_level = Level::Ansi256;
+    } else if (isatty(fileno(stdout))) {
+        g_level = Level::Basic;
+    } else {
+        g_level = Level::None;
+    }
 
     if (term && std::strcmp(term, "dumb") == 0) g_unicode = false;
     if (std::getenv("BIRUN_ASCII"))             g_unicode = false;
@@ -105,6 +109,9 @@ inline std::string dim   (const std::string& s) {
 inline std::string italic(const std::string& s) {
     return g_level == Level::None ? s : "\033[3m" + s + "\033[0m";
 }
+inline std::string underline(const std::string& s) {
+    return g_level == Level::None ? s : "\033[4m" + s + "\033[0m";
+}
 
 // ------------------------------------------------------------
 //  Semantic helpers
@@ -139,6 +146,9 @@ namespace sym {
     inline const char* spark()   { return g_unicode ? "⚡" : "!";   }
     inline const char* clock()   { return g_unicode ? "⏱" : "@";   }
     inline const char* dot()     { return g_unicode ? "·" : ".";   }
+    inline const char* timeout() { return g_unicode ? "⏱" : "TO";  }
+    inline const char* retry()   { return g_unicode ? "↻" : "R";   }
+    inline const char* cache()   { return g_unicode ? "❄" : "C";   }
 }
 
 // ------------------------------------------------------------
@@ -160,4 +170,15 @@ inline std::string padName(const std::string& n, size_t col = 24) {
     return n + std::string(col - n.size(), ' ');
 }
 
+// Simple percentage → string
+inline std::string pct(int num, int den) {
+    if (den <= 0) return "0%";
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%.0f%%", 100.0 * num / den);
+    return std::string(buf);
+}
+
 } // namespace birun::theme
+// ============================================================
+//  END OF FILE
+// ============================================================

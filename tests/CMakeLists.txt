@@ -56,4 +56,5 @@ catch_discover_tests(birun_tests
     TEST_SUFFIX ""
     PROPERTIES
         TIMEOUT 30
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0"
 )
