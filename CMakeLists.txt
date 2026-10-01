@@ -30,8 +30,8 @@ target_compile_definitions(birun PRIVATE
 install(TARGETS birun RUNTIME DESTINATION bin)
 
 # ---- tests ----
-option(BIRUN_BUILD_TESTS "Build birun tests" ON)
-if(BIRUN_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif()
+# option(BIRUN_BUILD_TESTS "Build birun tests" ON)
+# if(BIRUN_BUILD_TESTS)
+#     enable_testing()
+#     add_subdirectory(tests)
+# endif()

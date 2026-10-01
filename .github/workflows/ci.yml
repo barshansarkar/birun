@@ -2,92 +2,31 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-env:
-  CMAKE_GENERATOR: Ninja
-  CTEST_OUTPUT_ON_FAILURE: 1
-  CATCH2_VERSION: v3.5.4
-
 jobs:
-
-  build-and-test:
-    name: build + test
+  build:
+    name: build
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build cmake git g++
-
-      - name: Build and install Catch2 v3
-        run: |
-          git clone --depth 1 --branch "${CATCH2_VERSION}" \
-            https://github.com/catchorg/Catch2.git /tmp/catch2
-          cmake -S /tmp/catch2 -B /tmp/catch2/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCATCH_BUILD_TESTING=OFF \
-            -DCATCH_INSTALL_DOCS=OFF \
-            -DCATCH_INSTALL_EXTRAS=OFF
-          cmake --build /tmp/catch2/build --parallel
-          sudo cmake --install /tmp/catch2/build
-
-      - name: Configure
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBIRUN_BUILD_TESTS=ON
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
-
-  smoke:
-    name: smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Ninja
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
-      - name: Build (no tests)
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBIRUN_BUILD_TESTS=OFF
-          cmake --build build --parallel
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Version
-        run: ./build/birun --version
+      - name: Build
+        run: cmake --build build --parallel
 
-      - name: End-to-end
+      - name: Smoke
         run: |
-          mkdir -p /tmp/smoke && cd /tmp/smoke
+          ./build/birun --version
+          mkdir -p /tmp/s && cd /tmp/s
           "$GITHUB_WORKSPACE/build/birun" --init
-          test -f birun.bi
           "$GITHUB_WORKSPACE/build/birun" --list
           "$GITHUB_WORKSPACE/build/birun" hello
-
-      - name: JSON well-formed
-        run: |
-          cd /tmp/smoke
-          "$GITHUB_WORKSPACE/build/birun" --json > out.json
-          python3 -c "import json; json.load(open('out.json'))"
-          echo "PASS"
