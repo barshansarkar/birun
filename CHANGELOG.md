@@ -4,7 +4,7 @@ All notable changes to **birun** are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
-## [0.8.0] — 2026-01-XX
+## [0.8.0] — 2026-10-01
 
 ### Added
 - **`timeout(sec)`** task builtin — kills a task's command after N seconds
