@@ -45,8 +45,10 @@ target_link_libraries(birun_tests PRIVATE
     Catch2::Catch2WithMain
 )
 
-target_compile_options(birun_tests PRIVATE -Wall -Wextra)
-
+target_compile_options(birun_tests PRIVATE
+    -Wall -Wextra
+    -Wno-missing-field-initializers
+)
 # ---- Test discovery -------------------------------------------
 # Explicit absolute include — bypasses any module-path ordering issues.
 include("${BIRUN_CATCH_CMAKE_DIR}/Catch.cmake")

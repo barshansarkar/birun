@@ -29,15 +29,9 @@ target_compile_definitions(birun PRIVATE
 )
 install(TARGETS birun RUNTIME DESTINATION bin)
 
-# ---- tests ----
-# ---- tests ----
+# ---- tests ----  (target_compile_options for birun_tests lives in tests/CMakeLists.txt)
 option(BIRUN_BUILD_TESTS "Build birun tests" OFF)
 if(BIRUN_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
-
-target_compile_options(birun_tests PRIVATE
-    -Wall -Wextra
-    -Wno-missing-field-initializers   # <-- NEW
-)
