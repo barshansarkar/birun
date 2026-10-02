@@ -147,6 +147,7 @@ void Executor::printStats() const {
 //  runCommands
 //    - honours per-task timeout / env / cwd
 //    - retry wraps the WHOLE task (all runs) — see call sites
+//    - NEW: checks proc::cancelRequested() between commands
 // ============================================================
 int Executor::runCommands(const Task& t, std::string* captured) const {
     if (t.runs.empty()) return 0;
@@ -160,6 +161,7 @@ int Executor::runCommands(const Task& t, std::string* captured) const {
 
     for (const auto& cmd : t.runs) {
         if (proc::shutdownRequested()) return 130;
+        if (proc::cancelRequested())   return 130;
 
         if (cap) {
             if (showCmd) { *cap += "    "; *cap += sym::arrow(); *cap += " "; *cap += cmd; *cap += "\n"; }
@@ -190,7 +192,9 @@ int Executor::runCommands(const Task& t, std::string* captured) const {
             }
             return proc::kExitTimeout;
         }
+        if (rr.cancelled)              return proc::kExitCancelled;
         if (proc::shutdownRequested()) return 130;
+        if (proc::cancelRequested())   return proc::kExitCancelled;
         if (rr.exitCode != 0) return rr.exitCode;
     }
     return 0;
@@ -230,6 +234,9 @@ inline const char* verdictText(CacheVerdict v) {
 //  run
 // ============================================================
 int Executor::run(const std::string& target) {
+    // Fresh cancel state for this run (important for watch mode).
+    proc::resetCancel();
+
     auto wall0 = std::chrono::steady_clock::now();
     plan(target);
 
@@ -294,7 +301,7 @@ int Executor::runSequential() {
     bool dirty = false;
 
     for (const auto& n : order_) {
-        if (proc::shutdownRequested()) {
+        if (proc::shutdownRequested() || proc::cancelRequested()) {
             if (dirty && !opt_.noCache) {
                 try { store.save(cachePath); } catch (...) {}
             }
@@ -347,13 +354,16 @@ int Executor::runSequential() {
             rc = runCommands(t);
             if (rc == 0) break;
             if (proc::shutdownRequested()) break;
+            if (proc::cancelRequested())   break;
             if (attempts < maxAttempts) {
                 double waitSec = (t.retryBackoffMs / 1000.0) *
                                  (1 << (attempts - 1));   // exponential
                 if (waitSec > 30.0) waitSec = 30.0;
                 printRetry(t, attempts, maxAttempts - 1, waitSec);
                 int ms = (int)(waitSec * 1000);
-                while (ms > 0 && !proc::shutdownRequested()) {
+                while (ms > 0 &&
+                       !proc::shutdownRequested() &&
+                       !proc::cancelRequested()) {
                     int step = ms > 100 ? 100 : ms;
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(step));
@@ -397,6 +407,13 @@ int Executor::runSequential() {
 
 // ============================================================
 //  Parallel
+//
+//  Failure handling:
+//    - First failing task calls proc::requestCancel().
+//    - That sends SIGTERM to every registered child process.
+//    - Workers exit their loop on cancelRequested().
+//    - SIGKILL escalation is handled by each child's own wait loop
+//      (grace period) — see proc::shouldKill().
 // ============================================================
 int Executor::runParallel() {
     std::map<std::string, int>                      pending;
@@ -430,8 +447,10 @@ int Executor::runParallel() {
     for (int w = 0; w < nW; w++) {
         workers.emplace_back([&] {
             for (;;) {
-                if (failed.load() > 0) return;
+                // Exit conditions include cancel.
+                if (failed.load() > 0)         return;
                 if (proc::shutdownRequested()) return;
+                if (proc::cancelRequested())   return;
 
                 std::string taskName;
                 {
@@ -510,6 +529,8 @@ int Executor::runParallel() {
                         rc = runCommands(t, &captured);
                         if (rc == 0) break;
                         if (proc::shutdownRequested()) break;
+                        if (proc::cancelRequested())   break;
+
                         if (attempts < maxAttempts) {
                             double waitSec = (t.retryBackoffMs / 1000.0) *
                                              (1 << (attempts - 1));
@@ -519,7 +540,9 @@ int Executor::runParallel() {
                                 printRetry(t, attempts, maxAttempts - 1, waitSec);
                             }
                             int ms = (int)(waitSec * 1000);
-                            while (ms > 0 && !proc::shutdownRequested()) {
+                            while (ms > 0 &&
+                                   !proc::shutdownRequested() &&
+                                   !proc::cancelRequested()) {
                                 int step = ms > 100 ? 100 : ms;
                                 std::this_thread::sleep_for(
                                     std::chrono::milliseconds(step));
@@ -549,7 +572,29 @@ int Executor::runParallel() {
                 runningCount.fetch_sub(1);
                 done.fetch_add(1);
 
-                if (!fromCache && rc != 0) { failed.store(rc); return; }
+                               // ---- FAILURE → cancel all running siblings ----
+                // Only the FIRST failure determines the final exit code.
+                // Later failures are usually side-effects of the
+                // cancellation itself (exit 130) and must NOT overwrite
+                // the original error code.
+                if (!fromCache && rc != 0) {
+                    int expected = 0;
+                    bool first = failed.compare_exchange_strong(
+                        expected, rc,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+
+                    if (first && !opt_.silent) {
+                        std::lock_guard<std::mutex> lk(g_outMtx);
+                        std::cout << "  " << danger(sym::fail()) << " "
+                                  << danger("cancelling remaining tasks")
+                                  << "\n";
+                        std::cout.flush();
+                    }
+
+                    proc::requestCancel();
+                    return;
+                }
 
                 if (!fromCache && !opt_.noCache && !t.inputs.empty()) {
                     std::lock_guard<std::mutex> lk(cacheMtx);
@@ -566,22 +611,7 @@ int Executor::runParallel() {
 
     for (auto& w : workers) w.join();
 
-    if (proc::shutdownRequested()) {
-        if (dirty && !opt_.noCache) { try { store.save(cachePath); } catch (...) {} }
-        return 130;
-    }
-    if (failed.load() != 0) {
-        if (dirty && !opt_.noCache) { try { store.save(cachePath); } catch (...) {} }
-        return failed.load();
-    }
-    if (done.load() != total) {
-        if (!opt_.silent)
-            std::cerr << "  " << danger(sym::fail()) << " "
-                      << danger("execution stalled — " +
-                                std::to_string(total - done.load()) +
-                                " task(s) unfinished") << "\n";
-        return 1;
-    }
+    // Save successes (partial progress is real; do not discard).
     if (dirty && !opt_.noCache) {
         try { store.save(cachePath); }
         catch (std::exception& e) {
@@ -589,6 +619,17 @@ int Executor::runParallel() {
                 std::cerr << "  " << warn(sym::spark()) << " "
                           << warn(std::string("cache: ") + e.what()) << "\n";
         }
+    }
+
+    if (proc::shutdownRequested()) return 130;
+    if (failed.load() != 0)        return failed.load();
+    if (done.load() != total) {
+        if (!opt_.silent)
+            std::cerr << "  " << danger(sym::fail()) << " "
+                      << danger("execution stalled — " +
+                                std::to_string(total - done.load()) +
+                                " task(s) unfinished") << "\n";
+        return 1;
     }
     return 0;
 }

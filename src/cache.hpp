@@ -1,25 +1,31 @@
 #pragma once
 // ============================================================
-//  birun · cache.hpp  (v0.8.0)
+//  birun · cache.hpp  (v1.0.0)
 //  Task caching: input file hashes + task definition.
-//  - advisory flock() so concurrent runs don't corrupt the store
+//  - versioned file format (BIRUN_CACHE_MAGIC)
+//  - advisory flock() WITH RETRY — never overwrites under lock failure
 //  - atomic write via temp file + rename
 // ============================================================
 
 #include "executor.hpp"
+#include "version.hpp"
+#include "platform/fslock.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <stdexcept>
 #include <string>
-#include <sys/file.h>
-#include <fcntl.h>
-#include <unistd.h>
+// #include <sys/file.h>
+// #include <fcntl.h>
+#include <thread>
+// #include <unistd.h>
 #include <vector>
 
 namespace birun::cache {
@@ -55,7 +61,7 @@ inline uint64_t hashFile(const std::string& path) {
 }
 
 // ------------------------------------------------------------
-//  Wildcard match ('*' and '?' only, single segment)
+//  Wildcard / glob (unchanged)
 // ------------------------------------------------------------
 inline bool wildcardMatch(const std::string& name, const std::string& pat) {
     size_t ni = 0, pi = 0;
@@ -77,9 +83,6 @@ inline bool wildcardMatch(const std::string& name, const std::string& pat) {
     return pi == pat.size();
 }
 
-// ------------------------------------------------------------
-//  Glob expansion
-// ------------------------------------------------------------
 inline std::vector<std::string> expandGlob(const std::string& pattern) {
     std::vector<std::string> out;
     std::error_code ec;
@@ -156,11 +159,16 @@ inline std::string hashInputs(const std::vector<std::string>& globs) {
 }
 
 // ------------------------------------------------------------
-//  Hash task definition + input files (v0.8.0)
-//  Includes new fields: env, cwd, timeout, retry, backoff.
+//  Hash task definition + input files.
+//  Cache-format-versioned: any change to the mixing rules must
+//  bump BIRUN_CACHE_FORMAT in version.hpp.
 // ------------------------------------------------------------
 inline std::string hashTask(const Task& t) {
     uint64_t combined = 1469598103934665603ULL;
+
+    // Seed with cache format version — invalidates old cache when bumped.
+    const char* fmt = BIRUN_CACHE_MAGIC;
+    combined = fnv1a(fmt, std::strlen(fmt), combined);
 
     auto mixStr = [&combined](const std::string& s) {
         combined = fnv1a(s.data(), s.size(), combined);
@@ -212,52 +220,20 @@ inline bool outputsExist(const std::vector<std::string>& outputs) {
 }
 
 // ------------------------------------------------------------
-//  Advisory file lock (POSIX flock on <cache>.lock)
-//  Safe for concurrent birun invocations.
+//  Advisory file lock with RETRY.
+//  - LOCK_EX (exclusive) for writes
+//  - backoff: 5 attempts × (25, 50, 100, 200, 400 ms) = ~775 ms
 // ------------------------------------------------------------
-class CacheLock {
-public:
-    CacheLock() = default;
-    ~CacheLock() { release(); }
-    CacheLock(const CacheLock&) = delete;
-    CacheLock& operator=(const CacheLock&) = delete;
 
-    bool acquire(const std::string& cachePath) {
-        std::string lp = cachePath + ".lock";
-        auto dir = fs::path(lp).parent_path();
-        if (!dir.empty()) {
-            std::error_code ec;
-            fs::create_directories(dir, ec);
-        }
-        fd_ = ::open(lp.c_str(), O_RDWR | O_CREAT, 0644);
-        if (fd_ < 0) return false;
-        if (::flock(fd_, LOCK_EX) < 0) {
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        held_ = true;
-        return true;
-    }
-
-    void release() {
-        if (held_ && fd_ >= 0) {
-            ::flock(fd_, LOCK_UN);
-            ::close(fd_);
-        }
-        held_ = false;
-        fd_   = -1;
-    }
-
-    bool held() const { return held_; }
-
-private:
-    int  fd_   = -1;
-    bool held_ = false;
-};
 
 // ------------------------------------------------------------
-//  Cache store — load / save (atomic + locked)
+//  Cache store — versioned format.
+//
+//    Line 1:  BIRUN_CACHE_MAGIC   (e.g. "birun-cache-v2")
+//    Rest:    key \t value
+//
+//  On load, if the magic doesn't match → treat as empty (silent
+//  upgrade; old cache is simply discarded).
 // ------------------------------------------------------------
 struct CacheStore {
     std::map<std::string, std::string> entries;
@@ -266,31 +242,45 @@ struct CacheStore {
         CacheStore c;
         std::ifstream f(path, std::ios::binary);
         if (!f) return c;
+
+        std::string first;
+        if (!std::getline(f, first)) return c;
+        if (first != BIRUN_CACHE_MAGIC) {
+            // Version mismatch — invalidate everything.
+            return c;
+        }
+
         std::string line;
         while (std::getline(f, line)) {
             if (line.empty()) continue;
             auto tab = line.find('\t');
-            if (tab == std::string::npos) continue;   // skip malformed
+            if (tab == std::string::npos) continue;
             c.entries[line.substr(0, tab)] = line.substr(tab + 1);
         }
         return c;
     }
 
+    // Throws if the lock cannot be acquired. This is INTENTIONAL —
+    // silently overwriting a locked cache could lose another
+    // process's writes.
     void save(const std::string& path) const {
-        // Take an exclusive lock while writing. If we can't acquire,
-        // proceed anyway — a broken lock shouldn't kill a successful run,
-        // but we log it at the call site.
-        CacheLock lk;
-        bool haveLock = lk.acquire(path);
+               platform::FileLock lk;
+        if (!lk.acquire(path)) {
+            throw std::runtime_error(
+                "cache: could not acquire lock on '" + path +
+                ".lock' (another birun is writing?)");
+        }
 
         auto dir = fs::path(path).parent_path();
         if (!dir.empty()) {
             std::error_code ec;
             fs::create_directories(dir, ec);
         }
-
-        // Write to temp in the SAME directory → rename is atomic on POSIX.
+#ifdef _WIN32
+        std::string tmp = path + ".tmp." + std::to_string((unsigned long)GetCurrentProcessId());
+#else
         std::string tmp = path + ".tmp." + std::to_string(::getpid());
+#endif
 
         bool ok = true;
         {
@@ -298,6 +288,7 @@ struct CacheStore {
             if (!f) {
                 ok = false;
             } else {
+                f << BIRUN_CACHE_MAGIC << '\n';
                 for (const auto& kv : entries)
                     f << kv.first << '\t' << kv.second << '\n';
                 f.flush();
@@ -319,8 +310,6 @@ struct CacheStore {
             throw std::runtime_error(
                 "cache: cannot replace '" + path + "': " + ec.message());
         }
-
-        (void)haveLock;
     }
 };
 
@@ -334,22 +323,16 @@ inline std::string cacheFilePath() {
 }
 
 // ------------------------------------------------------------
-//  Clean — delete cache file (+ its lock)
+//  Clean
 // ------------------------------------------------------------
 inline bool cleanCache() {
     std::string path = cacheFilePath();
     std::error_code ec;
     bool removed = false;
-    if (fs::exists(path, ec)) {
-        removed = fs::remove(path, ec);
-    }
-    // best-effort: remove lockfile too
+    if (fs::exists(path, ec)) removed = fs::remove(path, ec);
     std::error_code ec2;
     fs::remove(path + ".lock", ec2);
     return removed;
 }
 
 } // namespace birun::cache
-// ============================================================
-//  END OF FILE
-// ============================================================

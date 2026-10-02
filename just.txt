@@ -1,0 +1,27 @@
+git commit -m "v1.0.0"
+
+Core:
+- Task graph with depends(), run(), inputs(), outputs()
+- Parallel execution (-j N) with first-failure cancel
+- Input-hash caching with versioned cache format
+- Per-task env / cwd / timeout / retry + backoff
+- Watch mode (inotify on Linux, polling fallback)
+
+Cross-platform:
+- POSIX process layer (fork/exec, process groups, signals)
+- Windows process layer (CreateProcess, Job Object, static .exe)
+- Cross-platform file lock (flock / LockFileEx)
+
+Robustness:
+- Signal-safe atomics with static_assert guarantees
+- Lock retry with backoff; never silent overwrite
+- Versioned cache invalidates on algorithm change
+
+Docs:
+- README with full feature list
+- VERSIONING.md — semantic versioning policy
+- CHANGELOG.md — release notes
+- LICENSE — MIT
+
+Tests: 64/64 pass on Linux (unit + integration)
+CI: multi-OS matrix (Linux, macOS, Windows) + cross-compile"

@@ -1,45 +1,32 @@
-# Changelog
+## [1.0.0] — 2026-10-02
 
-All notable changes to **birun** are documented here.
-Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning: [SemVer](https://semver.org/).
+First stable release.
 
-## [0.8.0] — 2026-10-01
+### Highlights
+- Cross-platform: Linux, macOS, BSD, Windows
+- Parallel tasks with first-failure cancel
+- Versioned input-hash cache
+- Watch mode (inotify on Linux)
+- Static Windows `.exe` (no external DLLs)
 
-### Added
-- **`timeout(sec)`** task builtin — kills a task's command after N seconds
-  (SIGTERM first, then SIGKILL after `--grace`, default 3 s).
-- **`retry(n, backoffMs)`** task builtin — re-runs the whole task up to
-  `n + 1` times with exponential backoff.
-- **Per-task `env("KEY", "VALUE")`** — environment variables scoped to a
-  task's child processes. Outside a task, `env("K")` still reads.
-- **Per-task `cwd("path")`** — run the task's commands from a chosen
-  directory. Outside a task, `cwd()` still returns the current dir.
-- **`--stats`** — per-task timings, slowest tasks, and cache hit ratio.
-- **`--explain`** — prints *why* each task ran (cache hit / miss reason).
-- **`-qq` / `--silent`** — birun prints nothing; only the exit code.
-- **`--grace N`** — seconds between SIGTERM and SIGKILL on shutdown/timeout.
-- **Verbose timeout diagnostics** — when `--verbose` is set and a command
-  times out, birun reports the timeout and grace period used.
-- **CI matrix**: Ubuntu (gcc + clang) and macOS (clang).
+### Platform status
+- Linux/macOS/BSD: **stable**
+- Windows: **experimental** (cross-compiled + Wine-tested;
+  field testing in progress)
 
-### Changed
-- **Graceful shutdown**: first SIGINT/SIGTERM sends SIGTERM to all children
-  and their process groups; after `--grace` seconds a reaper thread sends
-  SIGKILL. A second signal forces immediate SIGKILL.
-- **Cache file locking**: cache writes now take an advisory `flock` on
-  `<cache>.lock`, so two concurrent birun runs can't corrupt the cache.
-- **Child registry** grew from 512 → 4096 entries, and is now async-safe.
-- **Cache key** now includes `timeout`, `retry`, `env`, and `cwd`, so
-  changing these invalidates cached outputs.
-- `sh()`, `shStatus()`, `shFull()` now respect the surrounding task's
-  timeout / env / cwd, and `shFull()` returns an extra `timedOut` flag.
+### Tests
+- 64/64 pass on Linux (unit + integration)
+- CI: multi-OS matrix + MinGW cross-compile
 
 ### Fixed
-- `printFail()` now respects `--silent` / `-qq`.
-- `runSplit()` no longer leaks pipe fds on early-return paths.
+- Parallel failure now cancels all running siblings (CAS-first-fail)
+- Cache lock failures retry with backoff, then throw (never silent)
+- Signal handlers use only lock-free atomics
+- Watch mode uses inotify on Linux (low CPU)
 
-## [0.7.0] — earlier
-- Initial public release: task runner + bi language integration,
-  caching, parallel execution, watch mode, JSON / Graphviz output,
-  shell completions, `--init`.
+### Added
+- `version.hpp` — single source of truth
+- `VERSIONING.md` — semantic versioning policy
+- `tests/test_integration.cpp` — 11 end-to-end CLI tests
+- `src/platform/` — POSIX / Windows split
+- Static linking for Windows `.exe`

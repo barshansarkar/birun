@@ -1,10 +1,10 @@
 #pragma once
 // ============================================================
-//  birun · executor.hpp  (v0.8.0)
+//  birun · executor.hpp  (v1.0.0)
 // ============================================================
 #include <map>
 #include <set>
-#include <mutex>       
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,10 +21,9 @@ struct Task {
     std::vector<std::string> inputs;
     std::vector<std::string> outputs;
 
-    // v0.8.0
     std::vector<std::pair<std::string, std::string>> env;
     std::string              cwd;
-    int                      timeoutSec     = 0;      // 0 = none
+    int                      timeoutSec     = 0;
     int                      retryCount     = 0;
     int                      retryBackoffMs = 1000;
 };
@@ -37,10 +36,10 @@ struct Options {
     bool        noCache   = false;
     bool        force     = false;
     bool        clean     = false;
-    bool        silent    = false;   // -qq
-    bool        stats     = false;   // --stats
-    bool        explain   = false;   // --explain
-    int         graceSec  = 3;       // SIGTERM → SIGKILL grace
+    bool        silent    = false;
+    bool        stats     = false;
+    bool        explain   = false;
+    int         graceSec  = 3;
     Verbosity   verbosity = Verbosity::Normal;
     std::string file      = "birun.bi";
     std::string task;
@@ -93,8 +92,6 @@ private:
     void explain     (const std::string& name, const std::string& why) const;
     void printStats  () const;
 
-    // runs all t.runs, retrying the whole task on failure.
-    // `captured != nullptr` → buffer output; else live-stream.
     int runCommands(const Task& t, std::string* captured = nullptr) const;
 
     int runSequential();
@@ -102,6 +99,3 @@ private:
 };
 
 } // namespace birun
-// ============================================================
-//  END OF FILE
-// ============================================================

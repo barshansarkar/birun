@@ -17,8 +17,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <unistd.h>
-
+#ifdef _WIN32
+#  include <io.h>
+#  define isatty  _isatty
+#  define fileno  _fileno
+#else
+#  include <unistd.h>
+#endif
 namespace birun::theme {
 
 // ------------------------------------------------------------

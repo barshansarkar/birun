@@ -7,6 +7,7 @@
 #include "extras.hpp"
 #include "proc.hpp"
 #include "theme.hpp"
+#include "version.hpp"
 #include "watch.hpp"
 
 #include <chrono>
@@ -19,18 +20,24 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
+// ---- Windows-only: console UTF-8 + ANSI escape setup ----
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 using namespace bi;
 using namespace birun;
 using namespace birun::theme;
 
-#ifndef BIRUN_VERSION
-#define BIRUN_VERSION "0.0.0-dev"
-#endif
-
-static const char* VERSION = BIRUN_VERSION;
+// BIRUN_VERSION_STRING lives in version.hpp
+static const char* VERSION = BIRUN_VERSION_STRING;
 
 static std::map<std::string, Task> g_tasks;
 static std::vector<std::string>    g_taskOrder;
@@ -41,6 +48,41 @@ static bool        g_graphMode      = false;
 static bool        g_initMode       = false;
 static bool        g_initForce      = false;
 static std::string g_completionShell;
+
+// ============================================================
+//  Windows console setup
+//    - UTF-8 code page (for "·" "→" "✓" etc.)
+//    - Enable ANSI escape sequence processing (for Tokyo Night
+//      colors, which Wine / older consoles don't enable by default)
+//  No-op on POSIX.
+// ============================================================
+static void setupConsole() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hOut, &mode)) {
+            mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            mode |= ENABLE_PROCESSED_OUTPUT;
+            SetConsoleMode(hOut, mode);
+        }
+    }
+
+    // Also enable it on stderr, since errors/help go there sometimes.
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hErr, &mode)) {
+            mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            mode |= ENABLE_PROCESSED_OUTPUT;
+            SetConsoleMode(hErr, mode);
+        }
+    }
+#endif
+}
 
 // ============================================================
 //  CLI: usage
@@ -230,6 +272,7 @@ static void printList() {
 //  Run once
 // ============================================================
 static int runOnce() {
+    proc::resetCancel();   // fresh cancel state per invocation
     Executor ex(g_tasks, g_opt);
     return ex.run(g_opt.task);
 }
@@ -249,6 +292,16 @@ static int runWatchMode() {
               << rule(sym::dot()) << " "
               << hint("Ctrl-C to stop") << "\n\n";
 
+    // Try to set up an inotify watcher. On Linux this gives us
+    // event-driven wakeup (low CPU). Otherwise wait() sleeps.
+    birun::watch::Watcher watcher;
+    bool haveInotify = watcher.init(roots);
+    if (!haveInotify) {
+        std::cout << "  " << hint(sym::idle()) << " "
+                  << hint("polling mode (inotify unavailable)")
+                  << "\n\n";
+    }
+
     auto lastSnap = birun::watch::snapshot(roots);
     try {
         runOnce();
@@ -260,13 +313,18 @@ static int runWatchMode() {
     for (;;) {
         if (proc::shutdownRequested()) break;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // Block until either an inotify event arrives or the
+        // fallback poll interval elapses.
+        bool woke = watcher.wait(2000);
+
         if (proc::shutdownRequested()) break;
+        if (!woke) continue;   // pure timeout, no work — skip diffing
 
         auto nowSnap = birun::watch::snapshot(roots);
         auto changed = birun::watch::diff(lastSnap, nowSnap);
         if (changed.empty()) continue;
 
+        // Debounce: wait for writes to settle, then re-diff.
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         if (proc::shutdownRequested()) break;
 
@@ -312,6 +370,10 @@ static int runWatchMode() {
 //  main
 // ============================================================
 int main(int argc, char** argv) {
+    // Windows console: UTF-8 code page + ANSI escape processing.
+    // On POSIX, this is a no-op.
+    setupConsole();
+
     // Install signal handlers FIRST — so any child spawned later is
     // tracked and killed cleanly on SIGINT / SIGTERM / SIGHUP.
     proc::installSignalHandlers();

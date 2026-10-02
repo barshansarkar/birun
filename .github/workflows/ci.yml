@@ -8,25 +8,148 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: build
-    runs-on: ubuntu-latest
+  # ============================================================
+  #  Native build + test on Linux, macOS, Windows
+  # ============================================================
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake -S . -B build
+          -DBIRUN_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --config Release --parallel
 
-      - name: Smoke
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke (POSIX)
+        if: runner.os != 'Windows'
         run: |
           ./build/birun --version
           mkdir -p /tmp/s && cd /tmp/s
           "$GITHUB_WORKSPACE/build/birun" --init
           "$GITHUB_WORKSPACE/build/birun" --list
           "$GITHUB_WORKSPACE/build/birun" hello
+
+      - name: Smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\build\Release\birun.exe --version
+          mkdir -Force "$env:TEMP\smoke" | Out-Null
+          cd "$env:TEMP\smoke"
+          & "$env:GITHUB_WORKSPACE\build\Release\birun.exe" --init
+          & "$env:GITHUB_WORKSPACE\build\Release\birun.exe" --list
+          & "$env:GITHUB_WORKSPACE\build\Release\birun.exe" hello
+
+  # ============================================================
+  #  Cross-compile Windows .exe from Linux (MinGW-w64)
+  # ============================================================
+  cross-win:
+    name: cross-compile (Windows x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Configure (Windows target)
+        run: >
+          cmake -S . -B build-win
+          -DCMAKE_SYSTEM_NAME=Windows
+          -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-win --parallel
+
+      - name: Verify static .exe
+        run: |
+          file build-win/birun.exe
+          x86_64-w64-mingw32-objdump -p build-win/birun.exe | grep "DLL Name"
+          # Fail if any GCC runtime leaked in
+          if x86_64-w64-mingw32-objdump -p build-win/birun.exe | grep -E "libgcc|libstdc\+\+"; then
+            echo "ERROR: dynamic runtime dependency in .exe"
+            exit 1
+          fi
+
+      - name: Upload .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: birun-windows-x86_64
+          path: build-win/birun.exe
+          if-no-files-found: error
+
+  # ============================================================
+  #  Release on tag push (v*)
+  # ============================================================
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, cross-win]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build mingw-w64
+
+      # ---- Linux build (static) ----
+      - name: Build (Linux, static)
+        run: |
+          cmake -S . -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          cmake --build build-linux --parallel
+          strip build-linux/birun
+
+      # ---- Windows build ----
+      - name: Build (Windows, MinGW static)
+        run: |
+          cmake -S . -B build-win \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-win --parallel
+          x86_64-w64-mingw32-strip build-win/birun.exe
+
+      # ---- macOS build (cross-compile not practical — skip) ----
+      # macOS users build from source; Homebrew formula in future.
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp build-linux/birun       dist/birun-linux-x86_64
+          cp build-win/birun.exe     dist/birun-windows-x86_64.exe
+          cd dist
+          for f in *; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -lh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/birun-linux-x86_64
+            dist/birun-linux-x86_64.sha256
+            dist/birun-windows-x86_64.exe
+            dist/birun-windows-x86_64.exe.sha256
+          generate_release_notes: true
+          draft: false
